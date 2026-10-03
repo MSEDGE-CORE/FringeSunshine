@@ -177,9 +177,14 @@ class RtspServer : Thread("rtsp-server") {
         if (session.audioEncryptionEnabled && session.riKey == null) {
             session.audioEncryptionEnabled = false
         }
+        // resume 的二次 ANNOUNCE：编码器已启动，此时要重绑对端而非重启编码器
+        val resuming = session.isMediaStarted
         if (!session.startMedia()) {
             respond(client, cseq, "RTSP/1.0 500 INTERNAL SERVER ERROR")
             return
+        }
+        if (resuming) {
+            session.prepareForResume()
         }
         ServerCore.log(
             "ANNOUNCE：${session.config.width}x${session.config.height}@${session.config.fps}，" +

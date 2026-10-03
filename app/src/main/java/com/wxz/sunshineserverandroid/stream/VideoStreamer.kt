@@ -106,6 +106,12 @@ class VideoStreamer(
     private var lastPokeMs = 0L
     private var lastStallLogMs = 0L
 
+    /** 编码器实际配置的尺寸（resume 时 config 可能已被新 ANNOUNCE 改写，重挂表面必须用旧值） */
+    @Volatile
+    private var activeWidth = 0
+    @Volatile
+    private var activeHeight = 0
+
     override fun run() {
         try {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
@@ -146,6 +152,8 @@ class VideoStreamer(
     private fun streamLoop() {
         val width = configWidth()
         val height = configHeight()
+        activeWidth = width
+        activeHeight = height
         val fps = session.config.fps.coerceIn(10, 60)
         statsWindowStartMs = System.currentTimeMillis()
 
@@ -257,6 +265,36 @@ class VideoStreamer(
             }
             codec.releaseOutputBuffer(index, false)
             emitStats()
+        }
+    }
+
+    /**
+     * resume 的二次 ANNOUNCE 后调用：客户端换了对端，但源屏大概率静止，
+     * SurfaceFlinger 不会主动产出新 buffer，编码器零输入 → 客户端永远等首帧
+     * （悬浮窗 poke 在缺权限设备上也失效）。把编码表面从虚拟屏摘下再挂回，
+     * 走与首次会话完全相同的"切换表面"路径强制立刻合成一帧，并让它成为 IDR；
+     * 合成帧会在新 ping 到达前被 pendingPayload 暂存，随后补发。
+     */
+    fun forceFreshFrame() {
+        val s = surface ?: return
+        val pd = ServerCore.projectionDisplay ?: return
+        try {
+            pendingPayload = null
+            noPeerLogged = false
+            firstFrameLogged = false
+            peerReadyMs = 0L
+            lastFrameSentMs = 0L
+            requestSync = true
+            pd.detach(s)
+            val w = if (activeWidth > 0) activeWidth else configWidth()
+            val h = if (activeHeight > 0) activeHeight else configHeight()
+            if (!pd.attach(s, w, h, metrics.densityDpi)) {
+                ServerCore.log("恢复串流：重新挂载编码表面失败（投屏授权可能已失效）")
+                return
+            }
+            ServerCore.log("恢复串流：已重新挂载编码表面，强制源屏合成首帧（IDR）")
+        } catch (e: Exception) {
+            ServerCore.log("强制合成首帧失败：${e.javaClass.simpleName}: ${e.message}")
         }
     }
 

@@ -153,7 +153,7 @@ class NvHttpServer(
                 ServerCore.session?.stop()
                 respond(client, 200, "OK", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root status_code=\"200\"></root>")
             }
-            "/resume" -> respond(client, 200, "OK", resumeXml(localIp))
+            "/resume" -> handleResume(client, args, localIp, peer)
             "/servererror" -> respond(client, 200, "OK", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root status_code=\"200\"></root>")
             // 调试端点：导出应用内存日志（荣耀等系统屏蔽 logcat 时用）
             "/logs" -> respond(client, 200, "OK", ServerCore.snapshotLogs().joinToString("\n"))
@@ -281,8 +281,12 @@ class NvHttpServer(
 
     private fun serverInfoXml(uniqueId: String?, localIp: String): String {
         val paired = if (ServerCore.isPaired(uniqueId)) 1 else 0
+        val sessionRunning = ServerCore.session?.isRunning == true
         // state：Sunshine 约定 SUNSHINE_SERVER_BUSY / SUNSHINE_SERVER_FREE
-        val state = if (ServerCore.session?.isRunning == true) "SUNSHINE_SERVER_BUSY" else "SUNSHINE_SERVER_FREE"
+        val state = if (sessionRunning) "SUNSHINE_SERVER_BUSY" else "SUNSHINE_SERVER_FREE"
+        // currentgame：Moonlight 的 getCurrentGame() 只在 state 以 _SERVER_BUSY 结尾时读它，
+        // 恒报 0 会导致客户端不认为有会话在跑，resume 分支永远走不进去
+        val currentGame = if (sessionRunning) 1 else 0
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
             "<root status_code=\"200\">\n" +
             "  <hostname>${ServerCore.hostName}</hostname>\n" +
@@ -304,7 +308,7 @@ class NvHttpServer(
             "  <OutputDebugOptions>0</OutputDebugOptions>\n" +
             // 官方客户端读取 PairStatus（而非 paired），字段名错误会导致配对成功后仍显示未配对
             "  <PairStatus>$paired</PairStatus>\n" +
-            "  <currentgame>0</currentgame>\n" +
+            "  <currentgame>$currentGame</currentgame>\n" +
             "  <state>$state</state>\n" +
             "</root>"
     }
@@ -407,14 +411,20 @@ class NvHttpServer(
     ) {
         val existing = ServerCore.session
         if (existing != null && existing.isRunning) {
-            val age = System.currentTimeMillis() - existing.startedAtMs
-            if (existing.hasConnectedClient || age < StreamSession.SESSION_CONNECT_TIMEOUT_MS) {
+            val now = System.currentTimeMillis()
+            val goneMs = existing.clientGoneSinceMs
+            if (existing.hasConnectedClient ||
+                now - existing.startedAtMs < StreamSession.SESSION_CONNECT_TIMEOUT_MS ||
+                (goneMs != 0L && now - goneMs < StreamSession.RESUME_GRACE_MS)
+            ) {
+                // 客户端会带着 /launch 查询串里的新 rikey 重连，会话密钥必须同步换新
+                existing.updateRiKey(args["rikey"] ?: "", args["rikeyid"] ?: "")
                 respond(client, 200, "OK", launchXml(localIp, resumed = true))
                 return
             }
             // 僵尸会话：客户端从未接入控制通道且已超时 → 清理后继续创建新会话
             // stop() 同步清 ServerCore.session（授权闸门已移除，投影由常驻 VD 复用）
-            ServerCore.log("发现僵尸会话（${age / 1000}s 无控制通道），清理并重新启动")
+            ServerCore.log("发现僵尸会话（${(now - existing.startedAtMs) / 1000}s 无控制通道），清理并重新启动")
             existing.stop()
         }
         val config = StreamConfig.fromLaunchArgs(args)
@@ -434,22 +444,67 @@ class NvHttpServer(
         respond(client, 200, "OK", launchXml(localIp, resumed = false))
     }
 
+    /**
+     * /resume：客户端想恢复既有会话（Moonlight 的 resume 顺序是先断开旧 ENet 再发本请求）。
+     *
+     * 有可恢复会话（在线 / 建立中 / 断开宽限期内）直接回 resume=1；
+     * 没有就按 /launch 同款参数新建一个再回 resume=1——Moonlight 的
+     * `NvHTTP.launchApp("resume")` 见到 resume=0 会直接放弃（客户端表现为
+     * 永远卡在"恢复主机应用"转圈），而"桌面"镜像应用本来随时都可以重新开流。
+     */
+    private fun handleResume(
+        client: Socket,
+        args: Map<String, String>,
+        localIp: String,
+        peer: java.net.InetAddress?
+    ) {
+        val session = ServerCore.session
+        val now = System.currentTimeMillis()
+        val goneMs = session?.clientGoneSinceMs ?: 0L
+        val resumable = session != null && session.isRunning && (
+            session.hasConnectedClient ||
+                now - session.startedAtMs < StreamSession.SESSION_CONNECT_TIMEOUT_MS ||
+                (goneMs != 0L && now - goneMs < StreamSession.RESUME_GRACE_MS)
+            )
+        if (resumable) {
+            ServerCore.log(
+                "恢复既有会话（" +
+                    if (session!!.hasConnectedClient) "客户端在线" else "宽限期内重连" +
+                    "）"
+            )
+            // Moonlight 的 rikey 只随 /resume 查询串传递（ANNOUNCE 不带），必须在这里换新
+            session.updateRiKey(args["rikey"] ?: "", args["rikeyid"] ?: "")
+        } else {
+            if (session != null && session.isRunning) {
+                ServerCore.log("resume 请求但旧会话已过宽限期，回收后新建")
+                session.stop()
+            } else {
+                ServerCore.log("resume 请求但当前无会话，按 resume 参数新建会话")
+            }
+            val config = StreamConfig.fromLaunchArgs(args)
+            val listener = launchListener ?: run {
+                respond(client, 500, "Internal Server Error", xmlError(500))
+                return
+            }
+            if (listener.onLaunchRequested(config) == null) {
+                respond(client, 500, "Internal Server Error", xmlError(500))
+                return
+            }
+        }
+        respond(client, 200, "OK", resumeXml(localIp, resumed = true))
+    }
+
     private fun launchXml(ip: String, resumed: Boolean): String = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
         "<root status_code=\"200\">\n" +
         "  <sessionUrl0>rtsp://$ip:${RtspServer.PORT}</sessionUrl0>\n" +
         "  <gamesession>1</gamesession>\n" +
         "  <resume>" + (if (resumed) 1 else 0) + "</resume>\n</root>"
 
-    private fun resumeXml(localIp: String): String {
-        val session = ServerCore.session
-        val resumable = session != null && session.isRunning &&
-            (session.hasConnectedClient ||
-                System.currentTimeMillis() - session.startedAtMs < StreamSession.SESSION_CONNECT_TIMEOUT_MS)
-        val resume = if (resumable) 1 else 0
+    private fun resumeXml(localIp: String, resumed: Boolean): String {
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
             "<root status_code=\"200\">\n" +
             "  <sessionUrl0>rtsp://$localIp:${RtspServer.PORT}</sessionUrl0>\n" +
-            "  <resume>$resume</resume>\n" +
+            "  <resume>${if (resumed) 1 else 0}</resume>\n" +
             "  <gamesession>1</gamesession>\n" +
             "</root>"
     }

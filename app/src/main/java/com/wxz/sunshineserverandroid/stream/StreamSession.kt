@@ -45,6 +45,13 @@ class StreamSession(
     @Volatile
     var controlConnected = false
 
+    /**
+     * 客户端 ENet 断开的时刻（0 = 从未断开）。
+     * 断开后会话保留 [RESUME_GRACE_MS] 供客户端 resume 重新接入，宽限期过后才由看门狗回收。
+     */
+    @Volatile
+    var clientGoneSinceMs = 0L
+
     /** 控制流加密（SS_ENC_CONTROL_V2），由 RTSP ANNOUNCE 协商结果决定 */
     @Volatile
     var encryptionEnabled = false
@@ -52,8 +59,13 @@ class StreamSession(
     @Volatile
     var audioEncryptionEnabled = false
 
-    /** launch 的 rikey（16 字节 AES key），控制流加密用 */
-    val riKey: ByteArray? = parseRiKey(config.rikeyHex)
+    /**
+     * 当前 rikey（16 字节 AES key），控制流/音频加密共用。
+     * Moonlight 每次连接（含 resume）都生成新 rikey 并放进 ANNOUNCE，
+     * resume 时必须刷新，否则新客户端的加密控制帧全部解密失败。
+     */
+    @Volatile
+    var riKey: ByteArray? = parseRiKey(config.rikeyHex)
 
     /** 客户端在 SETUP 阶段获得的 ping payload（16 字节随机 hex 字符串） */
     val avPingPayload: String = run {
@@ -90,6 +102,14 @@ class StreamSession(
     private var videoPingLogged = false
     @Volatile
     private var audioPingLogged = false
+
+    /** ping 接收线程代数：resume 时换代，旧线程自行退出，避免两个接收线程抢 socket */
+    @Volatile
+    private var pingGeneration = 0
+
+    /** 编码器是否已启动（区分首次 ANNOUNCE 与 resume 的二次 ANNOUNCE） */
+    val isMediaStarted: Boolean
+        get() = mediaStarted
 
     fun start(): Boolean {
         if (isRunning) return true
@@ -146,13 +166,14 @@ class StreamSession(
      * 继续收只是白白抢发送时间；稳定后把 socket 完全让给发送线程。
      */
     private fun startPingReceiver() {
+        val generation = ++pingGeneration
         pingReceiver = Thread {
             val buf = ByteArray(256)
             var videoPings = 0
             var audioPings = 0
             var lastVideoPeer: InetSocketAddress? = null
             var lastAudioPeer: InetSocketAddress? = null
-            while (isRunning) {
+            while (isRunning && pingGeneration == generation) {
                 var listening = false
                 for (entry in listOf(Pair(videoSocket, true), Pair(audioSocket, false))) {
                     val socket = entry.first ?: continue
@@ -193,6 +214,27 @@ class StreamSession(
                 }
             }
         }.also { it.start() }
+    }
+
+    /**
+     * 客户端断开后重新协商（resume 的二次 ANNOUNCE）：客户端重新建了 UDP socket，
+     * 源端口大概率变了，必须清掉旧对端并重新监听 ping，否则视频/音频会一直发往死地址。
+     */
+    fun prepareForResume() {
+        videoPeer = null
+        audioPeer = null
+        videoPingLogged = false
+        audioPingLogged = false
+        clientGoneSinceMs = 0L
+        // 新 ANNOUNCE 带来了新 rikey（config.rikeyHex 已被 applyAnnounceArgs 更新），
+        // 控制流与音频加密都必须换新 key，否则解密全部失败
+        riKey = parseRiKey(config.rikeyHex)
+        startPingReceiver()
+        // resume 视为一次新的连接：息屏则点亮（与首次启动同一策略），并刷新常亮锁
+        com.wxz.sunshineserverandroid.input.CursorOverlay.acquireKeepAwake()
+        // 源屏静止时编码器无输入，强制重挂表面逼出一帧 IDR 首帧
+        videoStreamer?.forceFreshFrame()
+        ServerCore.log("会话恢复：已重置视频/音频对端，等待新 ping")
     }
 
     fun stop() {
@@ -270,6 +312,20 @@ class StreamSession(
     }
 
     /** "32 hex 字符 → 16 字节 key" */
+    /**
+     * /resume 或 /launch 命中既有会话时调用：Moonlight 每次连接都生成新 rikey，
+     * 且只通过 /resume（/launch）查询串传递——RTSP ANNOUNCE 不带 rikey，
+     * 不更新会导致新客户端的加密控制帧全部 AEADBadTag。
+     */
+    fun updateRiKey(rikeyHex: String, rikeyIdHex: String) {
+        if (rikeyHex.isNotEmpty()) {
+            config.rikeyHex = rikeyHex
+            config.rikeyIdHex = rikeyIdHex
+            riKey = parseRiKey(rikeyHex)
+            ServerCore.log("会话加密密钥已按 resume 参数更新")
+        }
+    }
+
     private fun parseRiKey(hex: String): ByteArray? {
         if (hex.length != 32) return null
         return try {
@@ -296,6 +352,13 @@ class StreamSession(
 
         /** launch 后客户端应接入控制通道的超时（健康流程 /launch→RTSP→ENet 通常 <5s） */
         const val SESSION_CONNECT_TIMEOUT_MS = 30_000L
+
+        /**
+         * 客户端 ENet 断开后会话的保留时长（Sunshine 同款语义：主机侧保持应用运行，
+         * 客户端随时 resume 重连）。Moonlight 的 resume 是"先断旧 ENet 再发 /resume"，
+         * 保留期内 /resume 才有会话可恢复。
+         */
+        const val RESUME_GRACE_MS = 60_000L
 
         fun sendUdp(socket: java.net.DatagramSocket, peer: InetSocketAddress?, data: ByteArray, length: Int) {
             val target = peer ?: return

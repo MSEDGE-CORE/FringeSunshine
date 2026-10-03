@@ -87,7 +87,19 @@ object CursorOverlay {
                             acquire(60 * 60 * 1000L)
                         }
                 }
-                wakeLock = null
+                // 会话级 SCREEN_BRIGHT_WAKE_LOCK：与 FLAG_KEEP_SCREEN_ON 等价的拦超时手段，
+                // 但不依赖悬浮窗窗口——缺"显示在其他应用上层"权限时 FLAG 挂不上，
+                // 串流中途超时息屏会让虚拟屏停止合成。用户主动按电源键息屏不受它影响。
+                if (wakeLock?.isHeld != true) {
+                    @Suppress("DEPRECATION")
+                    wakeLock = pm.newWakeLock(
+                        android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK,
+                        "sunshine:session-keep-awake"
+                    ).apply {
+                        setReferenceCounted(false)
+                        acquire(60 * 60 * 1000L)
+                    }
+                }
                 if (!pm.isInteractive) {
                     @Suppress("DEPRECATION")
                     val wl = pm.newWakeLock(
@@ -97,21 +109,20 @@ object CursorOverlay {
                     )
                     wl.setReferenceCounted(false)
                     wl.acquire(5_000L)
-                    ServerCore.log("串流开始：屏幕已熄灭，点亮后再开始串流")
+                    ServerCore.log("串流开始/恢复：屏幕已熄灭，点亮后再继续")
                 } else {
-                    ServerCore.log("串流开始：屏幕已点亮")
+                    ServerCore.log("串流开始/恢复：屏幕已点亮")
                 }
             } catch (e: Exception) {
                 ServerCore.log("点亮屏幕失败：${e.javaClass.simpleName}")
             }
-            if (!ensureAttached(context)) {
-                if (!Settings.canDrawOverlays(context)) {
-                    ServerCore.log("无法保持屏幕常亮/无法逼源屏出帧：缺少\"显示在其他应用上层\"权限")
-                }
-                return@post
+            // 悬浮窗尽量挂上（光标显示与 poke 逼帧仍依赖它），挂不上也不影响常亮
+            if (ensureAttached(context)) {
+                setKeepScreenOnFlag(context, true)
+                ServerCore.log("已挂载常亮悬浮窗（串流期间阻止息屏）")
+            } else if (!Settings.canDrawOverlays(context)) {
+                ServerCore.log("缺少\"显示在其他应用上层\"权限：光标不显示，已用系统 wakelock 保持常亮")
             }
-            setKeepScreenOnFlag(context, true)
-            ServerCore.log("已挂载常亮悬浮窗（串流期间阻止息屏）")
         }
     }
 

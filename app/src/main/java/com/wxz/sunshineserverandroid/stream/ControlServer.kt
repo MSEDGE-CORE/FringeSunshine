@@ -16,6 +16,7 @@ class ControlServer(private val session: StreamSession) {
     private val enet = ENetHost(StreamSession.CONTROL_PORT, object : ENetHost.Listener {
         override fun onConnected() {
             session.controlConnected = true
+            session.clientGoneSinceMs = 0L
         }
 
         override fun onPacket(payload: ByteArray) {
@@ -24,9 +25,11 @@ class ControlServer(private val session: StreamSession) {
 
         override fun onDisconnected() {
             session.controlConnected = false
-            if (session.isRunning) {
-                ServerCore.log("控制通道断开，结束会话")
-                session.stop()
+            if (session.isRunning && session.clientGoneSinceMs == 0L) {
+                session.clientGoneSinceMs = System.currentTimeMillis()
+                ServerCore.log(
+                    "控制通道断开，会话保留 ${StreamSession.RESUME_GRACE_MS / 1000}s 供客户端恢复"
+                )
             }
         }
 
@@ -63,11 +66,22 @@ class ControlServer(private val session: StreamSession) {
                     break
                 }
                 // 官方/v1 客户端都未接入：/launch 后客户端从未走到控制通道（中途退出/断网），
-                // 会话若不清理会一直 isRunning，吞掉后续所有 launch
+                // 会话若不清理会一直 isRunning，吞掉后续所有 launch。
+                // 注意排除"接入过又断开"的会话——那种走下面的宽限期回收。
                 if (session.isRunning && !session.hasConnectedClient &&
+                    session.clientGoneSinceMs == 0L &&
                     System.currentTimeMillis() - session.startedAtMs > StreamSession.SESSION_CONNECT_TIMEOUT_MS
                 ) {
                     ServerCore.log("会话创建 ${StreamSession.SESSION_CONNECT_TIMEOUT_MS / 1000}s 内无客户端控制通道连接，清理僵尸会话")
+                    session.stop()
+                    break
+                }
+                // 客户端接入过又断开：保留 RESUME_GRACE_MS 供 resume，过期回收
+                val goneMs = session.clientGoneSinceMs
+                if (session.isRunning && goneMs != 0L &&
+                    System.currentTimeMillis() - goneMs > StreamSession.RESUME_GRACE_MS
+                ) {
+                    ServerCore.log("客户端断开超过 ${StreamSession.RESUME_GRACE_MS / 1000}s 未恢复，回收会话")
                     session.stop()
                     break
                 }

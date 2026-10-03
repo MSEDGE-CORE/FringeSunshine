@@ -3,6 +3,7 @@ package com.wxz.sunshineserverandroid
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.provider.Settings
@@ -145,14 +146,26 @@ private fun MainContent(
         }
     }
 
+    // Android 14+ 可禁用投屏对话框里的"单个应用"选项：串流镜像的是整个屏幕，
+    // 单应用模式会导致虚拟屏拿不到完整画面
+    fun launchProjectionIntent() {
+        val manager = context.getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE)
+            as MediaProjectionManager
+        val captureIntent = if (android.os.Build.VERSION.SDK_INT >= 34) {
+            val config = MediaProjectionConfig.createConfigForDefaultDisplay()
+            manager.createScreenCaptureIntent(config)
+        } else {
+            manager.createScreenCaptureIntent()
+        }
+        projectionLauncher.launch(captureIntent)
+    }
+
     val notificationLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
         if (grants[Manifest.permission.POST_NOTIFICATIONS] == true) {
             waitingProjection = true
-            val manager = context.getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE)
-                as MediaProjectionManager
-            projectionLauncher.launch(manager.createScreenCaptureIntent())
+            launchProjectionIntent()
         } else {
             Toast.makeText(context, "缺少通知权限，前台服务无法运行", Toast.LENGTH_SHORT).show()
         }
@@ -185,9 +198,7 @@ private fun MainContent(
         }
         if (wanted.isEmpty()) {
             waitingProjection = true
-            val manager = context.getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE)
-                as MediaProjectionManager
-            projectionLauncher.launch(manager.createScreenCaptureIntent())
+            launchProjectionIntent()
         } else {
             notificationLauncher.launch(wanted.toTypedArray())
         }

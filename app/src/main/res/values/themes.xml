@@ -2,4 +2,12 @@
 <resources>
 
     <style name="Theme.SunshineServerAndroid" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- 启动画面：windowSplashScreenAnimatedIcon 置透明即可隐藏 12+ 默认弹出的应用图标 -->
+    <style name="Theme.SunshineServerAndroid.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/splash_light</item>
+        <item name="windowSplashScreenAnimatedIcon">@android:color/transparent</item>
+        <item name="windowSplashScreenAnimationDuration">0</item>
+        <item name="postSplashScreenTheme">@style/Theme.SunshineServerAndroid</item>
+    </style>
 </resources>

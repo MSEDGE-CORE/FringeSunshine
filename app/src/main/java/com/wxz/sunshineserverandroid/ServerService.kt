@@ -14,6 +14,7 @@ import android.os.IBinder
 import com.wxz.sunshineserverandroid.net.MdnsPublisher
 import com.wxz.sunshineserverandroid.net.NvHttpServer
 import com.wxz.sunshineserverandroid.net.RtspServer
+import com.wxz.sunshineserverandroid.stream.ProjectionDisplay
 import com.wxz.sunshineserverandroid.stream.StreamConfig
 import com.wxz.sunshineserverandroid.stream.StreamSession
 
@@ -43,9 +44,21 @@ class ServerService : Service(), NvHttpServer.LaunchListener {
             return START_NOT_STICKY
         }
 
-        val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
+        // intent 为 null：START_STICKY 自动重启（进程被系统清理后）。
+        // MediaProjection 授权随进程死亡失效、无法找回，但 HTTP/RTSP/mDNS 可以先恢复，
+        // 客户端至少能发现主机；串流需要用户回到应用重新授权。
+        if (intent == null) {
+            startAsForeground()
+            startServers()
+            ServerCore.running = true
+            ServerCore.log("服务已从系统清理中自动恢复（网络服务已重启）；屏幕采集授权已失效，串流前请回到应用重新授权")
+            logBatteryHint()
+            return START_STICKY
+        }
+
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         @Suppress("DEPRECATION")
-        val resultData = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
         if (resultCode == 0 || resultData == null) {
             ServerCore.log("缺少投屏授权数据，服务无法启动")
             stopSelf()
@@ -54,26 +67,61 @@ class ServerService : Service(), NvHttpServer.LaunchListener {
 
         startAsForeground()
 
-        val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        try {
-            projection = manager.getMediaProjection(resultCode, resultData)
-        } catch (e: Exception) {
-            ServerCore.log("获取 MediaProjection 失败: ${e.message}")
+        // 服务已在运行（自动恢复后用户重新授权）：只补绑投影，不重启网络服务
+        if (ServerCore.running) {
+            if (bindProjection(resultCode, resultData)) {
+                ServerCore.log("已重新绑定屏幕采集授权，可以继续串流")
+            }
+            return START_STICKY
+        }
+
+        if (!bindProjection(resultCode, resultData)) {
             stopSelf()
             return START_NOT_STICKY
         }
+        startServers()
+        ServerCore.running = true
+        ServerCore.log("服务已启动，等待客户端连接")
+        logBatteryHint()
+        return START_STICKY
+    }
 
+    /** 绑定/重建 MediaProjection 与常驻虚拟屏；旧的失效资源会先释放 */
+    private fun bindProjection(resultCode: Int, resultData: Intent): Boolean {
+        val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        return try {
+            val old = projection
+            projection = manager.getMediaProjection(resultCode, resultData)
+            ServerCore.projectionDisplay?.release()
+            ServerCore.projectionDisplay = ProjectionDisplay(projection!!)
+            try {
+                old?.stop()
+            } catch (_: Exception) {
+            }
+            true
+        } catch (e: Exception) {
+            ServerCore.log("获取 MediaProjection 失败: ${e.message}")
+            false
+        }
+    }
+
+    /** 启动全部网络服务（HTTP/HTTPS/RTSP/mDNS） */
+    private fun startServers() {
         NvHttpServer.launchListener = this
         // 常驻虚拟屏：整个服务生命周期只 createVirtualDisplay 一次（Android 14+ 强制），
         // 会话间用 setSurface/resize 切换，会话可无限次进入
-        ServerCore.projectionDisplay = com.wxz.sunshineserverandroid.stream.ProjectionDisplay(projection!!)
         httpServer = NvHttpServer().also { it.startServer() }
         httpsServer = NvHttpServer(NvHttpServer.HTTPS_PORT, tls = true).also { it.startServer() }
         rtspServer = RtspServer().also { it.startServer() }
         mdnsPublisher = MdnsPublisher(this).also { it.start() }
-        ServerCore.running = true
-        ServerCore.log("服务已启动，等待客户端连接")
-        return START_NOT_STICKY
+    }
+
+    /** 未加入电池优化白名单时提示：ColorOS 的内存清理会连可见前台服务一起杀 */
+    private fun logBatteryHint() {
+        val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+            ServerCore.log("提示：应用未加入电池优化白名单，部分机型（OPPO/一加等）投屏中可能被系统清理杀掉；可在 设置→后台保活 处理")
+        }
     }
 
     private fun startAsForeground() {

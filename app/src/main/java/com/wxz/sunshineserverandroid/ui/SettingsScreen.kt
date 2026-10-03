@@ -1,6 +1,8 @@
 package com.wxz.sunshineserverandroid.ui
 
+import android.content.Context
 import android.content.Intent
+import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
@@ -14,7 +16,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Accessibility
+import androidx.compose.material.icons.filled.BatteryFull
 import androidx.compose.material.icons.filled.Mouse
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -163,6 +167,41 @@ fun SettingsScreen(onBack: () -> Unit) {
                                 )
                             )
                         }
+                    }
+                )
+            }
+
+            SettingsSection("后台保活") {
+                val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                val ignoringBattery = pm.isIgnoringBatteryOptimizations(context.packageName)
+                SettingsItem(
+                    icon = Icons.Filled.BatteryFull,
+                    title = "忽略电池优化",
+                    subtitle = if (ignoringBattery) {
+                        "已忽略，系统省电策略不会限制本应用"
+                    } else {
+                        "未忽略，点击授权（防止投屏中被系统断网、清理杀进程）"
+                    },
+                    onClick = {
+                        context.startActivity(
+                            Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                android.net.Uri.parse("package:" + context.packageName)
+                            )
+                        )
+                    }
+                )
+                SettingsItem(
+                    icon = Icons.Filled.Shield,
+                    title = "厂商后台限制（ColorOS 等）",
+                    subtitle = "OPPO/一加机型请在此处：应用信息 → 电池 → 允许完全后台行为；并在多任务界面下拉锁定本应用。否则投屏中可能被系统内存清理杀掉",
+                    onClick = {
+                        context.startActivity(
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                android.net.Uri.parse("package:" + context.packageName)
+                            )
+                        )
                     }
                 )
             }

@@ -22,6 +22,8 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- 鼠标模式在本机屏幕/采集画面中画一个可见光标指针 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 申请加入电池优化白名单：ColorOS 等 ROM 的省电/内存清理（Athena FastClear）会杀掉投屏中的前台服务 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:allowBackup="true"

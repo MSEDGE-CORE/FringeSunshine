@@ -496,25 +496,18 @@ class NvHttpServer(
         }
     }
 
-    /** 程序生成的 640x360 应用封面（纯色 + 标题），避免 /appasset 返回 404 */
+    /**
+     * 应用封面：**空白图**（640x360 全透明 PNG）。
+     *
+     * 之前这里画的是深蓝圆角块 + "Sunshine" 文字，现在按需求删掉、留空。
+     * 仍然返回 200 + 合法 PNG，而不是空 body/404 —— 见 /appasset 处注释：
+     * 空响应会让部分 Moonlight 客户端把整条应用记录判为异常。
+     */
     private fun boxArtPng(appId: String): ByteArray = try {
-        val w = 640
-        val h = 360
-        val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
-        val canvas = android.graphics.Canvas(bitmap)
-        canvas.drawColor(android.graphics.Color.rgb(0x1E, 0x2A, 0x3A))
-        val accent = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-            color = android.graphics.Color.rgb(0x4C, 0x8D, 0xFF)
-        }
-        canvas.drawRoundRect(
-            android.graphics.RectF(48f, 48f, w - 48f, h - 48f), 28f, 28f, accent
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            640, 360, android.graphics.Bitmap.Config.ARGB_8888
         )
-        val textPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-            color = android.graphics.Color.WHITE
-            textSize = 64f
-            textAlign = android.graphics.Paint.Align.CENTER
-        }
-        canvas.drawText("Sunshine", w / 2f, h / 2f, textPaint)
+        // 不绘制任何内容：ARGB_8888 新建即全透明
         val out = java.io.ByteArrayOutputStream()
         bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
         bitmap.recycle()

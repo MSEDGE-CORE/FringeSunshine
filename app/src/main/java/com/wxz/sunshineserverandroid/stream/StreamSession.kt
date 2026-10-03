@@ -77,6 +77,15 @@ class StreamSession(
         private set
 
     private var pingReceiver: Thread? = null
+
+    /**
+     * ping 线程当前正阻塞在 socket.receive() 里的起始时刻（0 = 不在 receive）。
+     * 用来验证一个关键怀疑：DatagramSocket 的 send/receive 若共用一把锁，
+     * ping 线程 200ms 的阻塞接收会把视频线程的 send 卡住 → 帧间隔抖动。
+     */
+    @Volatile
+    var pingReceiveSinceMs = 0L
+        internal set
     @Volatile
     private var videoPingLogged = false
     @Volatile
@@ -128,23 +137,59 @@ class StreamSession(
         }
     }
 
-    /** 监听视频/音频端口的客户端 ping，确定对端地址 */
+    /**
+     * 监听视频/音频端口的客户端 ping，确定对端地址。
+     *
+     * 对端连续确认 PING_STABLE_COUNT 次后就**停止阻塞接收**：`socket.receive()` 阻塞时会
+     * 持有这把 socket 的锁，同一 socket 上的 `send()` 只能干等到超时才发出去（实测单次
+     * 卡 50~200ms，慢包全部落在 ping 处于 receive 中的那一刻）。局域网内客户端源端口不会变，
+     * 继续收只是白白抢发送时间；稳定后把 socket 完全让给发送线程。
+     */
     private fun startPingReceiver() {
         pingReceiver = Thread {
             val buf = ByteArray(256)
+            var videoPings = 0
+            var audioPings = 0
+            var lastVideoPeer: InetSocketAddress? = null
+            var lastAudioPeer: InetSocketAddress? = null
             while (isRunning) {
+                var listening = false
                 for (entry in listOf(Pair(videoSocket, true), Pair(audioSocket, false))) {
                     val socket = entry.first ?: continue
+                    val isVideo = entry.second
+                    val pings = if (isVideo) videoPings else audioPings
+                    if (pings >= PING_STABLE_COUNT) continue
+                    listening = true
                     try {
-                        socket.soTimeout = 200
+                        socket.soTimeout = VIDEO_PING_TIMEOUT_MS
                         val packet = DatagramPacket(buf, buf.size)
+                        pingReceiveSinceMs = System.currentTimeMillis()
                         socket.receive(packet)
+                        pingReceiveSinceMs = 0L
                         val message = String(buf, 0, packet.length, Charsets.US_ASCII)
-                        onAvPing(entry.second, packet.address, packet.port, message)
+                        if (!onAvPing(isVideo, packet.address, packet.port, message)) continue
+                        val now = if (isVideo) videoPeer else audioPeer
+                        if (isVideo) {
+                            if (now == lastVideoPeer) videoPings++ else {
+                                lastVideoPeer = now
+                                videoPings = 1
+                            }
+                        } else {
+                            if (now == lastAudioPeer) audioPings++ else {
+                                lastAudioPeer = now
+                                audioPings = 1
+                            }
+                        }
                     } catch (_: java.net.SocketTimeoutException) {
+                        pingReceiveSinceMs = 0L
                     } catch (_: Exception) {
+                        pingReceiveSinceMs = 0L
                         if (!isRunning) return@Thread
                     }
+                }
+                if (!listening) {
+                    ServerCore.log("视频/音频对端已稳定，停止 ping 接收（socket 全让给发送线程）")
+                    break
                 }
             }
         }.also { it.start() }
@@ -239,6 +284,12 @@ class StreamSession(
     }
 
     companion object {
+        /** 对端发现阶段的 receive 超时（越小，发现期 send 被锁卡住的上限越小） */
+        const val VIDEO_PING_TIMEOUT_MS = 50
+
+        /** 同一地址连续确认几次 ping 后认为对端稳定，此后不再阻塞接收 */
+        const val PING_STABLE_COUNT = 5
+
         const val VIDEO_PORT = 47998
         const val CONTROL_PORT = 47999
         const val AUDIO_PORT = 48000

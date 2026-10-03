@@ -132,7 +132,8 @@ class ControlServer(private val session: StreamSession) {
     private fun dispatchControl(type: Int, payload: ByteArray) {
         when (type) {
             TYPE_PERIODIC_PING -> lastPingTime = System.currentTimeMillis()
-            TYPE_LOSS_STATS, TYPE_FRAME_STATS -> Unit
+            TYPE_LOSS_STATS -> handleLossStats(payload)
+            TYPE_FRAME_STATS -> Unit
             TYPE_REQUEST_IDR, TYPE_INVALIDATE_REF_FRAMES -> session.requestIdr()
             TYPE_INPUT_DATA -> handleInput(payload, encrypted = session.encryptionEnabled)
             TYPE_TERMINATION -> {
@@ -174,7 +175,10 @@ class ControlServer(private val session: StreamSession) {
 
         when (type) {
             TYPE_PERIODIC_PING -> lastPingTime = System.currentTimeMillis()
-            TYPE_LOSS_STATS -> Unit
+            TYPE_LOSS_STATS -> {
+                lastPingTime = System.currentTimeMillis()
+                handleLossStats(payload)
+            }
             TYPE_REQUEST_IDR -> {
                 lastPingTime = System.currentTimeMillis()
                 session.requestIdr()
@@ -190,6 +194,38 @@ class ControlServer(private val session: StreamSession) {
             }
         }
     }
+
+    /**
+     * 客户端 0x0201 丢包统计（Sunshine 同款，little-endian int32[4]）：
+     * [0]=上次报告以来丢的包数，[1]=间隔毫秒，[3]=最后完好帧号。
+     * 这是**唯一能直接证明 WiFi 是否在丢包**的数据源，优先于任何猜测。
+     */
+    private fun handleLossStats(payload: ByteArray) {
+        if (payload.size < 16) return
+        val lost = le32(payload, 0)
+        val intervalMs = le32(payload, 4)
+        val lastGood = le32(payload, 12)
+        totalLoss += lost
+        val now = System.currentTimeMillis()
+        if (lost > 0) {
+            lastLossLogMs = now
+            ServerCore.log(
+                "客户端丢包：本次=$lost 包 / ${intervalMs}ms（累计=$totalLoss），最后完好帧=$lastGood"
+            )
+        } else if (now - lastLossLogMs >= 10_000L) {
+            lastLossLogMs = now
+            ServerCore.log("客户端丢包：近 ${intervalMs}ms 内 0 包（累计=$totalLoss）")
+        }
+    }
+
+    private var lastLossLogMs = 0L
+    private var totalLoss = 0L
+
+    private fun le32(buf: ByteArray, off: Int): Int =
+        (buf[off].toInt() and 0xFF) or
+            ((buf[off + 1].toInt() and 0xFF) shl 8) or
+            ((buf[off + 2].toInt() and 0xFF) shl 16) or
+            ((buf[off + 3].toInt() and 0xFF) shl 24)
 
     private fun le16(buf: ByteArray, off: Int): Int =
         ((buf[off].toInt() and 0xFF) or ((buf[off + 1].toInt() and 0xFF) shl 8))

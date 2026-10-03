@@ -83,35 +83,21 @@ object InputDispatcher {
         ServerCore.log("输入派发：$name（辅助功能=$svc）")
     }
 
-    // ---------------- 鼠标按键：UP 之后才合成操作 ----------------
+    // ---------------- 鼠标按键：按下即上屏、实时跟手 ----------------
     //
-    // 之前左键一按下就把屏幕按住，抬手那一下再从 A 跳到 B —— 中间鼠标随手一动就变成
-    // 一次瞬移拖拽，App 看到的就是「点一下却滚了一屏」；而且按住不放时 stroke 一直续约，
-    // 按住 500ms 就被系统判成长按。
+    // DOWN 一到就在**按下点**起一条 continued stroke，之后每个 move 把最新位置作为下一段
+    // 目标续上去（continueStroke + continues=true），全程**不抬手、不重新按下**：
+    // 按下点从头到尾只有最初那一个，绝不会 up/down 重置。
+    // UP 时补最后一段（continues=false）抬手，落点就是抬手位置。
     //
-    // 现在：**按住期间不上屏任何 delta**，只记采样；一切都在松手那一刻才识别 ——
-    //   · 位移 ≥ 阈值 → **滚动**：把「记忆的 DOWN 位置 → 抬手位置」整段注入一次，
-    //     时长按抬手前的速率换算（快 = 短时长 = 快滚，慢 = 长时长 = 慢滚）。
-    //     段位移必须 ≥ MIN_SCROLL_SEGMENT_PX，否则系统会把「按下→微移→抬起」
-    //     读成**单击**，在按下位置误触发点击。
-    //   · 位移 < 阈值且按住 ≥500ms → 上屏**长按**
-    //   · 位移 < 阈值且短按        → 上屏**单击**
-    private const val LONG_PRESS_MS = 500L
-
-    /**
-     * 单击/长按的「按下→抬起」时长**复刻真实按住时长**（UP 时刻 - DOWN 时刻），
-     * 只在两端夹一下：太短系统不认，太长会被 TOUCH_HOLD_MS 强制收尾。
-     */
-    private const val MIN_PRESS_DURATION_MS = 40L
-    private const val MAX_PRESS_DURATION_MS = 4_000L
+    // **不做任何「单击 / 长按 / 滑动阈值」分类**，原始输入原样上屏：
+    //   按住不动 → 系统自然读成长按；小位移 → 系统自然读成点击；大位移 → 自然读成拖动，
+    //   全部由目标 App 自己判断，我们不替它改写输入。
 
     /** 上屏右键点击的「按下→抬起」模拟时长 */
     private const val RIGHT_CLICK_DURATION_MS = 120L
 
-    /** 滑动识别阈值：抬手前累计位移达到它就算滚动，否则按单击/长按处理 */
-    private const val DRAG_THRESHOLD_PX = 60f
-
-    /** 单个滚动段的最小位移（小于触摸 slop 会被 App 读成单击），必须 ≥ DRAG_THRESHOLD_PX */
+    /** 滚轮攒够这个位移才派发（太小会被 App 读成点一下） */
     private const val MIN_SCROLL_SEGMENT_PX = 60f
 
     /** 按住期间保留的采样点数（够算 0.5s 以上的速率即可） */
@@ -120,11 +106,12 @@ object InputDispatcher {
     /** 一次性滚动路径最多画多少个点（识别到的位置太多时均匀抽样） */
     private const val MAX_SCROLL_STEPS = 64
 
-    /** 抬手前取这个时间窗内的位移算速率（fling 速度） */
-    private const val FLING_WINDOW_MS = 250L
-
     /** 滚动默认段时长（滚轮用）；按住拖动改用速率换算的时长 */
     private const val SCROLL_SEGMENT_MS = 150L
+
+    /** 兜底一次性手势的按住时长夹取范围 */
+    private const val MIN_PRESS_HOLD_MS = 40L
+    private const val MAX_PRESS_HOLD_MS = 4_000L
 
     private const val MIN_SCROLL_DUR_MS = 120L
     private const val MAX_SCROLL_DUR_MS = 3_000L
@@ -153,33 +140,6 @@ object InputDispatcher {
     private val dragST = LongArray(MAX_DRAG_SAMPLES)
     private var dragN = 0
 
-    /** 抬手后延迟释放的长按任务（新按下会取消它） */
-    @Volatile
-    private var pendingRelease: Runnable? = null
-
-    /** 上屏按下（现在只有鼠标合成的点击/长按会用到）；返回是否成功按下 */
-    private fun pressAt(x: Float, y: Float): Boolean {
-        if (held) return false
-        pendingRelease?.let { uiHandler.removeCallbacks(it); pendingRelease = null }
-        beginTouch(x, y)
-        return true
-    }
-
-    /** 上屏松手 */
-    private fun releaseAt(x: Float, y: Float) {
-        if (!held) return
-        pendingRelease?.let { uiHandler.removeCallbacks(it); pendingRelease = null }
-        endTouch(x, y)
-    }
-
-    /** 所有合成的 down→up 都必须带一个模拟时长，不能背靠背发完就结束 */
-    private fun pressAndRelease(x: Float, y: Float, durationMs: Long) {
-        if (!pressAt(x, y)) return
-        val release = Runnable { releaseAt(x, y) }
-        pendingRelease = release
-        uiHandler.postDelayed(release, durationMs)
-    }
-
     // ---------------- 绝对鼠标 ----------------
 
     /** NV_ABS_MOUSE_MOVE_PACKET：x/y/unused/width/height 均 BE16 */
@@ -196,8 +156,22 @@ object InputDispatcher {
         noteGeometry(x, y, width, height, screenX, screenY)
         CursorOverlay.moveTo(screenX, screenY)
 
-        // 按住期间**不上屏任何 delta**：只记采样，UP 时一次性按速率识别滚动/单击。
-        if (leftButtonDown) recordDragSample(screenX, screenY)
+        // 按住期间：记采样（链断时的兜底路径用），并把**最新位置**实时喂给在途链。
+        if (leftButtonDown) {
+            recordDragSample(screenX, screenY)
+            synchronized(gestureLock) {
+                lastInputMs = android.os.SystemClock.uptimeMillis()
+                if (held) {
+                    // 最新优先：还没派发出去的旧目标直接被覆盖，绝不排队积压
+                    if (hypot(screenX - chainX, screenY - chainY) >= 1f) {
+                        pendingX = clampX(screenX)
+                        pendingY = clampY(screenY)
+                        pendingValid = true
+                    }
+                    pumpLocked()
+                }
+            }
+        }
     }
 
     private fun recordDragSample(x: Float, y: Float) {
@@ -217,21 +191,6 @@ object InputDispatcher {
 
     private fun clearDragSamples() {
         dragN = 0
-    }
-
-    /** 抬手前 FLING_WINDOW_MS 窗口内的速率（px/ms）；样本不足则退回全程均速 */
-    private fun dragSpeed(dxArm: Float, dyArm: Float, armT: Long): Float {
-        if (dragN == 0) return 0f
-        val li = dragN - 1
-        val tEnd = dragST[li]
-        var base = 0
-        for (i in li downTo 0) {
-            if (tEnd - dragST[i] >= FLING_WINDOW_MS) { base = i; break }
-        }
-        val bx = if (base == li) dxArm else dragSX[li] - dragSX[base]
-        val by = if (base == li) dyArm else dragSY[li] - dragSY[base]
-        val dt = if (base == li) (tEnd - armT) else (tEnd - dragST[base])
-        return if (dt > 0) hypot(bx, by) / dt else 0f
     }
 
     private var lastGeoLogMs = 0L
@@ -267,6 +226,8 @@ object InputDispatcher {
                 armKnown = lastX >= 0
                 clearDragSamples()
                 armAtMs = android.os.SystemClock.uptimeMillis()
+                // 按下点立刻上屏并保持 down，之后的 move 全都续在这一条链上
+                beginTouch(lastX, lastY)
             } else {
                 if (!leftButtonDown) return
                 leftButtonDown = false
@@ -278,64 +239,44 @@ object InputDispatcher {
         }
     }
 
-    /** 左键抬起：**滚动/单击/长按三者都在这里才识别**，按住期间不上屏任何东西 */
+    /**
+     * 左键抬起：**不做任何识别分类**，原样上屏 —— 走到抬手位置然后抬起。
+     * 链还活着就续最后一段收尾（continues=false）；链从没建立起来才走一次性兜底。
+     */
     private fun finishMouseButton() {
-        val x = if (armKnown) armX else lastX
-        val y = if (armKnown) armY else lastY
-        val armT = armAtMs
-        if (x < 0) {
+        val n = dragN
+        val alive = synchronized(gestureLock) { held }
+        if (alive) {
+            endTouch(lastX, lastY)
             clearDragSamples()
             return
         }
-
-        // 必须在 clearDragSamples() **之前**把采样读出来，否则速率/按住时长全是 0
-        val n = dragN
-        if (armKnown && n > 0) {
-            val li = n - 1
-            val dx = dragSX[li] - x
-            val dy = dragSY[li] - y
-            val dist = hypot(dx, dy)
-            val endT = dragST[li]
-            val speed = dragSpeed(dx, dy, armT)
-            if (dist >= DRAG_THRESHOLD_PX) {
-                // emitScroll 要读采样，必须排在 clearDragSamples() 之前
-                emitScroll(dx, dy, dist, speed, armT, endT)
-                clearDragSamples()
-                return
-            }
+        // 按下从未成功（首段被拒绝）→ 一次性兜底：按下点 → 最后位置，时长 = 真实按住时长。
+        // 链曾经按下过但中途断了就不兜底了，否则会把整条输入重放一遍变成两次操作。
+        if (armKnown && n > 0 && !pointerWasDown) {
+            emitFallbackOneShot()
             clearDragSamples()
-        } else {
-            clearDragSamples()
+            return
         }
-
-        // 单击/长按都按**真实按住时长**复刻上屏，只在两端夹一下
-        val heldMs = android.os.SystemClock.uptimeMillis() - armT
-        val pressMs = heldMs.coerceIn(MIN_PRESS_DURATION_MS, MAX_PRESS_DURATION_MS)
-        val kind = if (heldMs >= LONG_PRESS_MS) "长按" else "单击"
-        ServerCore.log(
-            "UP识别为$kind 按住=${heldMs}ms → 上屏按下→抬起 ${pressMs}ms" +
-                "（真实时长复刻，落点 ${x.toInt()},${y.toInt()}）"
-        )
-        pressAndRelease(x, y, pressMs)
+        clearDragSamples()
+        ServerCore.log("UP：链已收尾或无采样（pointerWasDown=$pointerWasDown），不兜底")
     }
 
     /**
-     * UP 时注入的滚动：**一次性**在记忆的 DOWN 位置按下 →依次经过识别到的每个位置 → 抬起。
-     * 整个过程只有一个手势、一个总时长（= 位移 / 抬手前的速率 → 输入越快上屏越快）。
-     *
-     * 不再拆成多段链：多段链每段都要重新按下，会把「最初的按下点」重置掉。
+     * **兜底**（正常流程走不到）：整条输入压成一个一次性手势 —— 按下点 → 记录到的每个位置 →
+     * 抬手位置，一个手势、一个总时长（= 真实按住时长），按下点同样不会被重置。
      */
-    private fun emitScroll(dx: Float, dy: Float, dist: Float, speed: Float, armT: Long, endT: Long) {
-        val total = (if (speed > 0.001f) (dist / speed).toLong() else MAX_SCROLL_DUR_MS)
-            .coerceIn(MIN_SCROLL_DUR_MS, MAX_SCROLL_DUR_MS)
+    private fun emitFallbackOneShot() {
         val n = dragN
         if (n <= 0) return
-
-        val ax = if (armKnown) armX else screenWidth() / 2f
-        val ay = if (armKnown) armY else screenHeight() / 2f
+        val ax = if (armKnown) armX else lastX
+        val ay = if (armKnown) armY else lastY
+        if (ax < 0) return
         val startX = clampX(ax)
         val startY = clampY(ay)
         val stride = if (n > MAX_SCROLL_STEPS) (n + MAX_SCROLL_STEPS - 1) / MAX_SCROLL_STEPS else 1
+        val heldMs = (android.os.SystemClock.uptimeMillis() - armAtMs)
+            .coerceIn(MIN_PRESS_HOLD_MS, MAX_PRESS_HOLD_MS)
 
         val path = Path()
         path.moveTo(startX, startY)
@@ -352,17 +293,12 @@ object InputDispatcher {
             }
             i += stride
         }
-        // 末点必取：抬手位置一定被模拟到
         val ex = clampX(dragSX[n - 1])
         val ey = clampY(dragSY[n - 1])
         if (abs(ex - lx) >= 1f || abs(ey - ly) >= 1f) path.lineTo(ex, ey)
 
-        ServerCore.log(
-            "UP识别为滚动 dist=${dist.toInt()}px 速度=%.3fpx/ms".format(speed) +
-                " 按住=${endT - armT}ms → **一次性**总时长=${total}ms" +
-                " 路径=${pts}个点 着力点=(${ax.toInt()},${ay.toInt()})"
-        )
-        dispatchScrollPath(path, total)
+        ServerCore.log("链断兜底：一次性手势 ${pts}点 按住=${heldMs}ms 着力点=(${ax.toInt()},${ay.toInt()})")
+        dispatchScrollPath(path, heldMs)
     }
 
     /** NV_SCROLL_PACKET/SS_HSCROLL：scrollAmt1、scrollAmount 均 BE16 */
@@ -571,16 +507,18 @@ object InputDispatcher {
     private const val SEGMENT_MS = 24L
 
     /**
-     * 按住不动时的续约窗口。
-     * 上一段走完才会派发下一段，所以这个值直接决定「收到 UP 之后还要多久才真正抬手」——
-     * 太大 → 单击被拉成长按；太小 → 续约派发太频繁。80ms 是折中。
+     * 按住不动时的续约窗口（每段跑完就再续一段，指针始终不抬）。
+     * UP 走 wantEnd 分支，只等当前在途段跑完就抬手，所以这个值不影响抬手延迟。
      */
-    private const val HOLD_RENEW_MS = 80L
+    private const val HOLD_RENEW_MS = 32L
+
+    /** 续约最小间隔：防链异常时 1ms 级自旋（会拖垮推流） */
+    private const val RENEW_MIN_INTERVAL_MS = 24L
 
     /** 回调丢失时的兜底，超过就强制推进，否则输入会永久卡死 */
     private const val STROKE_TIMEOUT_MS = 1_000L
 
-    /** 一直没有新输入事件则强制收尾，避免释放丢失后屏幕被永久按住 */
+    /** 按住无移动时打「还在按着」心跳日志的周期（不再强制收尾，按住本来就是长按） */
     private const val TOUCH_HOLD_MS = 5_000L
 
     /**
@@ -600,6 +538,10 @@ object InputDispatcher {
     /** 屏幕上是否正被按住（鼠标合成的点击/长按） */
     @Volatile
     private var held = false
+
+    /** 系统里是否真的存在一个按下的指针（首段派发成功=true，抬手段成功=false） */
+    @Volatile
+    private var pointerWasDown = false
 
     /** 已派发链的末端坐标（下一段的起点必须与它重合） */
     @Volatile
@@ -636,13 +578,29 @@ object InputDispatcher {
 
 
 
-    private fun settle(gen: Int) {
+    private fun settle(gen: Int, completed: Boolean, atMs: Long, durMs: Long) {
         synchronized(gestureLock) {
+            val elapsed = System.currentTimeMillis() - atMs
+            // 段被取消 / 提前结束 = 链可能已经断了，必须看得见，否则会退化成死循环空转
+            if (!completed) noteBadCallback("段被取消", elapsed, durMs)
+            else if (elapsed + 5 < durMs) noteBadCallback("段提前结束", elapsed, durMs)
             if (gen != strokeGen) return
             if (!inFlight) return
             inFlight = false
             pumpLocked()
         }
+    }
+
+    private var lastBadLogMs = 0L
+
+    private fun noteBadCallback(what: String, elapsed: Long, durMs: Long) {
+        val now = System.currentTimeMillis()
+        if (now - lastBadLogMs < 1000) return
+        lastBadLogMs = now
+        ServerCore.log(
+            "⚠️ $what：实际=${elapsed}ms 请求=${durMs}ms 段数=$segCount" +
+                " 位移=(${lastSegDx.toInt()},${lastSegDy.toInt()})"
+        )
     }
 
     /** 回调丢失的兜底：在途手势超过 STROKE_TIMEOUT_MS 就当作它结束了 */
@@ -681,16 +639,18 @@ object InputDispatcher {
             return
         }
 
-        // 按住不动：续约，否则段走完手指就被系统抬起来
-        if (System.currentTimeMillis() - lastInputMs > TOUCH_HOLD_MS) {
-            ServerCore.log("按压超过 ${TOUCH_HOLD_MS / 1000}s 无输入事件，强制收尾")
-            held = false
-            wantEnd = false
-            pendingValid = false
-            dispatchSegmentLocked(chainX, chainY, SEGMENT_MS, continues = false)
-            activeStroke = null
+        // 按住不动：持续续约，**绝不中途抬手** —— 「按住不动」本来就是长按的原始输入。
+        // （UP 丢失的兜底交给 reset()/cancelTouch，而不是在这里自作主张松手）
+        // 续约限频：链被系统取消时回调会 1ms 内回来，这里不限频就会以 ~1000 次/秒
+        // 狂发 dispatchGesture（binder 风暴），把 CPU 抢走导致推流卡顿。
+        val now = System.currentTimeMillis()
+        val since = now - lastRenewMs
+        if (since < RENEW_MIN_INTERVAL_MS) {
+            schedulePumpLocked(RENEW_MIN_INTERVAL_MS - since)
             return
         }
+        lastRenewMs = now
+        noteIdleHold()
         dispatchSegmentLocked(chainX, chainY, HOLD_RENEW_MS, continues = true)
     }
 
@@ -699,26 +659,25 @@ object InputDispatcher {
         val x = clampX(toX)
         val y = clampY(toY)
         val prev = activeStroke
-        val stroke = if (prev == null) {
+        // 起点 = 上一段**成功派发**的终点，必须严格对上，否则系统不认这条链
+        val fx = clampX(chainX)
+        val fy = clampY(chainY)
+        val path = if (prev == null) {
             // 首段：单点路径（框架按 tap 处理，指针原地按住）
-            GestureDescription.StrokeDescription(
-                Path().apply { moveTo(x, y) }, 0, duration, continues
-            )
+            Path().apply { moveTo(x, y) }
         } else {
-            // 续段：起点必须严格等于上一段终点，否则系统不认这条链
-            val fx = clampX(chainX)
-            val fy = clampY(chainY)
-            GestureDescription.StrokeDescription(
-                Path().apply {
-                    moveTo(fx, fy)
-                    lineTo(x, y)
-                }, 0, duration, continues
-            )
+            Path().apply {
+                moveTo(fx, fy)
+                lineTo(x, y)
+            }
         }
-        activeStroke = stroke
-        chainX = x
-        chainY = y
-        noteSegment(x, y, duration, continues)
+        // 关键：续段必须用 continueStroke 挂到上一段的 strokeId 上，
+        // 这样系统才**不重新下发 DOWN** —— 换成独立 StrokeDescription 就会 up/down 重置。
+        val stroke = if (prev != null && prev.willContinue()) {
+            prev.continueStroke(path, 0, duration, continues)
+        } else {
+            GestureDescription.StrokeDescription(path, 0, duration, continues)
+        }
 
         val svc = service()
         if (svc == null) {
@@ -727,13 +686,20 @@ object InputDispatcher {
             activeStroke = null
             return
         }
+        noteSegment(x, y, duration, continues)
         val gen = ++strokeGen
         inFlight = true
         inFlightAtMs = System.currentTimeMillis()
+        lastSegDurMs = duration
+        lastSegDx = x - fx
+        lastSegDy = y - fy
+        val atMs = System.currentTimeMillis()
         val callback = object : AccessibilityService.GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription) = settle(gen)
+            override fun onCompleted(gestureDescription: GestureDescription) =
+                settle(gen, true, atMs, duration)
 
-            override fun onCancelled(gestureDescription: GestureDescription) = settle(gen)
+            override fun onCancelled(gestureDescription: GestureDescription) =
+                settle(gen, false, atMs, duration)
         }
         val ok = try {
             svc.dispatchGesture(
@@ -744,10 +710,58 @@ object InputDispatcher {
             false
         }
         if (!ok) {
+            // 派发失败：状态一律不推进（chainX/activeStroke 保持在上一段），下次重试同一步
             inFlight = false
-            ServerCore.log("dispatchGesture 被拒绝，本段丢失")
+            if (prev == null) {
+                held = false
+                activeStroke = null
+                ServerCore.log("按下段被拒绝，链未建立（UP 时走一次性兜底）")
+            } else {
+                ServerCore.log("续段被拒绝，等下一次输入重试")
+            }
+            return
+        }
+        // 成功才推进：chainX/Y = 系统里 pointer 当前的位置
+        activeStroke = stroke
+        chainX = x
+        chainY = y
+        if (prev == null) pointerWasDown = true
+        if (!continues) {
+            // 抬手段派发成功 → 指针已释放；pointerWasDown 仍为 true，表示「这条按下真的发生过」
+            activeStroke = null
         }
     }
+
+    private var lastIdleLogMs = 0L
+    private var lastRenewMs = 0L
+
+    /** 下一次补跑 pump 的任务（限频用），新的会被替换掉 */
+    private var pendingPump: Runnable? = null
+
+    /** 调用方必须持有 gestureLock */
+    private fun schedulePumpLocked(delayMs: Long) {
+        if (pendingPump != null) return
+        val task = Runnable {
+            synchronized(gestureLock) {
+                pendingPump = null
+                pumpLocked()
+            }
+        }
+        pendingPump = task
+        uiHandler.postDelayed(task, delayMs)
+    }
+
+    /** 长按期间每 10s 打一次「还在按着」，确认链没断 */
+    private fun noteIdleHold() {
+        val now = System.currentTimeMillis()
+        if (now - lastIdleLogMs < TOUCH_HOLD_MS) return
+        lastIdleLogMs = now
+        ServerCore.log("按住无移动：持续续约保持 down（链段数=$segCount）")
+    }
+
+    private var lastSegDurMs = 0L
+    private var lastSegDx = 0f
+    private var lastSegDy = 0f
 
     private var segCount = 0
     private var lastSegLogMs = 0L
@@ -756,7 +770,7 @@ object InputDispatcher {
     private fun noteSegment(x: Float, y: Float, duration: Long, continues: Boolean) {
         segCount++
         val now = System.currentTimeMillis()
-        if (segCount > 5 && now - lastSegLogMs < 1000) return
+        if (continues && segCount > 5 && now - lastSegLogMs < 1000) return
         lastSegLogMs = now
         ServerCore.log(
             "段#$segCount → (${x.toInt()},${y.toInt()}) 时长=${duration}ms" +
@@ -774,6 +788,7 @@ object InputDispatcher {
             pendingValid = false
             segCount = 0
             activeStroke = null
+            pointerWasDown = false
             chainX = x
             chainY = y
             lastInputMs = System.currentTimeMillis()
@@ -846,10 +861,11 @@ object InputDispatcher {
     fun reset() {
         cancelTouch()
         CursorOverlay.hide()
-        pendingRelease?.let { uiHandler.removeCallbacks(it); pendingRelease = null }
         leftButtonDown = false
         armKnown = false
+        pendingPump?.let { uiHandler.removeCallbacks(it); pendingPump = null }
         clearDragSamples()
+        pointerWasDown = false
         pendingScrollDX = 0f
         pendingScrollDY = 0f
         pendingScrollMs = SCROLL_SEGMENT_MS

@@ -55,7 +55,46 @@ class VideoStreamer(
     private var statsBytes = 0L
     private var statsWindowStartMs = 0L
 
+    /** 上一帧进入发送的时刻，用来算帧间隔抖动（流畅度的直接指标） */
+    private var lastFrameAtMs = 0L
+
+    /** 本窗口内的帧间隔样本（ms），定长环形，够 5s@60fps 用 */
+    private val ivBuf = IntArray(384)
+    private var ivN = 0
+    private var ivIdx = 0
+    private var ivMax = 0
+    private var ivOver33 = 0
+
+    /** 画面静止（无输入帧）造成的超长间隔单独计数，不进抖动统计，否则把静止误判成卡顿 */
+    private var ivIdle = 0
+    private var ivIdleMax = 0
+
+    /** 编码线程在 sendQueue 上被回压（队列满）的累计 ms / 次数 */
+    private var queueBlockMs = 0L
+    private var queueBlockN = 0
+
+    /** 本窗口累计 socket.send 阻塞耗时（ns）与异常次数 */
+    @Volatile
+    private var sendNanos = 0L
+    @Volatile
+    private var sendErrors = 0
+    @Volatile
+    private var sendCount = 0
+    @Volatile
+    private var sendMaxNs = 0L
+    @Volatile
+    private var sendSlow = 0
+    @Volatile
+    private var sendSlowWhilePing = 0
+    @Volatile
+    private var slowLogCount = 0
+
     private var packetBuf: ByteArray? = null
+
+    /** 编码→发送 的有界队列：满 6 帧（≈100ms @60fps）才回压编码器 */
+    private val sendQueue = java.util.concurrent.ArrayBlockingQueue<OutFrame>(6)
+
+    private var senderThread: Thread? = null
 
     /** 对端 ping 之前编码出来的帧先存住，否则首帧直接被丢掉，客户端要等下一次画面变化才有画面 */
     private var pendingPayload: ByteArray? = null
@@ -66,11 +105,27 @@ class VideoStreamer(
     private var lastFrameSentMs = 0L
     private var lastPokeMs = 0L
     private var lastStallLogMs = 0L
+    private var lastWakeMs = 0L
 
     override fun run() {
         try {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
         } catch (_: Exception) {
+        }
+        senderThread = Thread(
+            {
+                try {
+                    senderLoop()
+                } catch (e: Exception) {
+                    if (!stopped.get()) {
+                        ServerCore.log("视频发送线程异常: ${e.javaClass.simpleName}: ${e.message}")
+                    }
+                }
+            },
+            "video-sender"
+        ).also {
+            it.priority = Thread.MAX_PRIORITY - 1
+            it.start()
         }
         try {
             streamLoop()
@@ -80,6 +135,11 @@ class VideoStreamer(
                 ServerCore.log("视频线程异常退出: $reason")
                 session.fail(reason)
             }
+        }
+        stopped.set(true)
+        try {
+            senderThread?.interrupt()
+        } catch (_: Exception) {
         }
         release()
     }
@@ -204,10 +264,15 @@ class VideoStreamer(
         }
         val last = lastFrameSentMs
         val quietMs = now - if (last != 0L) last else peerReadyMs
-        if (quietMs < 1_500L) return
+        if (quietMs < POKE_AFTER_QUIET_MS) return
+        // 先只逼一帧合成，不动屏幕
         if (now - lastPokeMs >= 300L) {
             lastPokeMs = now
             com.wxz.sunshineserverandroid.input.CursorOverlay.poke()
+        }
+        // 有画面就不唤醒：只有连续这么久一点输出都没有（逼帧也救不回来），才认定源屏真的停了
+        if (quietMs >= WAKE_AFTER_QUIET_MS && now - lastWakeMs >= WAKE_RETRY_MS) {
+            lastWakeMs = now
             com.wxz.sunshineserverandroid.input.CursorOverlay.ensureAwake()
         }
         if (quietMs >= 5_000L && now - lastStallLogMs >= 10_000L) {
@@ -234,13 +299,72 @@ class VideoStreamer(
         if (elapsed < 5_000L) return
         val encoded = statsEncoded
         val bytes = statsBytes
+        val sendMs = sendNanos / 1_000_000.0
+        val errs = sendErrors
         statsEncoded = 0
         statsBytes = 0L
+        sendNanos = 0L
+        sendErrors = 0
+        val sCount = sendCount
+        val sMaxMs = sendMaxNs / 1_000_000.0
+        val sSlow = sendSlow
+        val sSlowPing = sendSlowWhilePing
+        sendCount = 0
+        sendMaxNs = 0L
+        sendSlow = 0
+        sendSlowWhilePing = 0
+        slowLogCount = 0
         statsWindowStartMs = now
+        lastFrameAtMs = 0L
+        val intervals = if (ivN > 1) IntArray(ivN) { ivBuf[it] } else IntArray(0)
+        val idle = ivIdle
+        val idleMax = ivIdleMax
+        ivN = 0
+        ivIdx = 0
+        ivMax = 0
+        ivOver33 = 0
+        ivIdle = 0
+        ivIdleMax = 0
+        val qMs = queueBlockMs
+        val qN = queueBlockN
+        queueBlockMs = 0L
+        queueBlockN = 0
         val sec = elapsed / 1000.0
+        val ivInfo = if (intervals.size > 1) {
+            intervals.sort()
+            val p50 = intervals[intervals.size / 2]
+            val p95 = intervals[(intervals.size * 95 / 100).coerceAtMost(intervals.size - 1)]
+            val max = intervals[intervals.size - 1]
+            val over = intervals.count { it > 33 }
+            val idleInfo = if (idle > 0) "｜静止间隔 $idle 次 最长=${idleMax}ms" else ""
+            "活跃帧间隔 p50=${p50}ms p95=${p95}ms max=${max}ms（>33ms 的 $over 次）$idleInfo"
+        } else "帧间隔 n/a"
+        val qInfo = if (qN > 0) " 队列回压=${qMs}ms/$qN 次" else ""
         ServerCore.log(
-            "视频统计：${"%.1f".format(encoded / sec)} fps，${"%.1f".format(bytes * 8 / 1000.0 / sec)} kbps"
+            "视频统计：${"%.1f".format(encoded / sec)} fps，${"%.1f".format(bytes * 8 / 1000.0 / sec)} kbps" +
+                "｜$ivInfo｜发送=${"%.1f".format(sendMs)}ms/${sCount}包 最大=${"%.0f".format(sMaxMs)}ms" +
+                " 慢包(>5ms)=$sSlow（ping 在 receive=$sSlowPing）异常=$errs$qInfo"
         )
+    }
+
+    /** 记录一次帧间隔（流畅度直接指标：抖动=掉帧/卡顿） */
+    private fun noteFrameInterval() {
+        val now = System.currentTimeMillis()
+        val last = lastFrameAtMs
+        lastFrameAtMs = now
+        if (last == 0L) return
+        val iv = (now - last).coerceIn(0, 5_000).toInt()
+        // >300ms = 上一帧至今画面根本没变化（SurfaceFlinger 不出帧），不是编码/发送卡顿
+        if (iv > IDLE_GAP_MS) {
+            ivIdle++
+            if (iv > ivIdleMax) ivIdleMax = iv
+            return
+        }
+        if (iv > ivMax) ivMax = iv
+        if (iv > 33) ivOver33++
+        ivBuf[ivIdx] = iv
+        ivIdx = (ivIdx + 1) % ivBuf.size
+        if (ivN < ivBuf.size) ivN++
     }
 
     private fun buildFormat(width: Int, height: Int, fps: Int, bitrateBps: Int, bitrateMode: Int): MediaFormat =
@@ -265,9 +389,19 @@ class VideoStreamer(
     }
 
     /** 一帧编码数据切包发送 */
+    /** 发送线程队列元素：编码完的一整帧负载 */
+    private class OutFrame(val payload: ByteArray, val ptsUs: Long, val idr: Boolean)
+
+    /**
+     * 编码线程只做**入队**，绝不碰 socket。
+     *
+     * 实测（1584x1584@60，~8Mbps）：`socket.send()` 单次可阻塞 100~300ms，5s 窗口里累计
+     * 2.5~3.3s 花在 send 上 —— 它一旦卡住，`dequeueOutputBuffer` 停摆 → 编码器输出堆积 →
+     * 放行后一串帧连着涌出（帧间隔实测 p50=3ms / max=1.3s），客户端看到的就是「憋一下再喷」的卡顿。
+     * 现在慢的代价由队列吸收（6 帧≈100ms 上限），编码节奏不再被网络牵着走。
+     */
     private fun sendFrame(frameData: ByteArray, isIdr: Boolean, ptsUs: Long) {
-        val peer: InetSocketAddress? = session.videoPeer
-        if (peer == null) {
+        if (session.videoPeer == null) {
             pendingPayload = frameData
             pendingIdr = isIdr
             pendingPts = ptsUs
@@ -277,15 +411,50 @@ class VideoStreamer(
             }
             return
         }
+        statsEncoded++
+        statsBytes += frameData.size
+        noteFrameInterval()
+        lastFrameSentMs = System.currentTimeMillis()
+        val q0 = System.nanoTime()
+        try {
+            sendQueue.put(OutFrame(frameData, ptsUs, isIdr))
+        } catch (_: InterruptedException) {
+        }
+        val qdt = (System.nanoTime() - q0) / 1_000_000L
+        if (qdt > 5L) {
+            queueBlockMs += qdt
+            queueBlockN++
+        }
+    }
+
+    /** 发送线程：全进程唯一调用视频 socket.send 的地方 */
+    private fun senderLoop() {
+        while (!stopped.get()) {
+            val item = try {
+                sendQueue.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                break
+            } ?: continue
+            writeFrame(item)
+        }
+        // 收尾：把还在队列里的帧冲掉（会话已停，发多少算多少）
+        while (true) {
+            val item = sendQueue.poll() ?: break
+            writeFrame(item)
+        }
+    }
+
+    /** 把一帧切成 RTP 分片发出去（只在发送线程跑） */
+    private fun writeFrame(item: OutFrame) {
+        val peer: InetSocketAddress = session.videoPeer ?: return
         val socket = session.videoSocket ?: return
+        val frameData = item.payload
+        val ptsUs = item.ptsUs
 
         val packetSize = session.config.packetSize.coerceIn(256, 1024 * 64)
         val blockSize = packetSize + MAX_RTP_HEADER_SIZE
         val payloadPerPacket = blockSize - HEADER_SIZE
         val frameHeaderSize = 8
-
-        statsEncoded++
-        statsBytes += frameData.size
 
         // 总负载 = 8B 短帧头 + 帧数据，按 payloadPerPacket 切片（最后一片自然短）
         val totalPayload = frameHeaderSize + frameData.size
@@ -293,7 +462,7 @@ class VideoStreamer(
 
         val timestamp = (ptsUs / 1000L * 90L).toInt() // us -> 90kHz 时钟
         val frameIndex = frameCounter++
-        val frameType: Int = if (isIdr) 2 else 1
+        val frameType: Int = if (item.idr) 2 else 1
         val lastPayloadLen = totalPayload % payloadPerPacket
         val lastLen = if (lastPayloadLen == 0) payloadPerPacket else lastPayloadLen
 
@@ -324,13 +493,31 @@ class VideoStreamer(
             }
             // 剩余部分保持 0 填充（与 Sunshine 对齐块一致）
 
+            val t0 = System.nanoTime()
             try {
                 socket.send(DatagramPacket(packet, blockSize, peer.address, peer.port))
             } catch (_: Exception) {
+                sendErrors++
+            }
+            val dt = System.nanoTime() - t0
+            sendNanos += dt
+            sendCount++
+            if (dt > sendMaxNs) sendMaxNs = dt
+            if (dt > 5_000_000L) {
+                sendSlow++
+                val since = session.pingReceiveSinceMs
+                if (since != 0L) sendSlowWhilePing++
+                if (dt > 20_000_000L && slowLogCount < 5) {
+                    slowLogCount++
+                    ServerCore.log(
+                        "send 阻塞 ${dt / 1_000_000}ms｜此刻 ping 线程" +
+                            (if (since != 0L) "已在 receive 里 ${System.currentTimeMillis() - since}ms（疑似锁争用）"
+                            else "不在 receive")
+                    )
+                }
             }
         }
         lowSeq = (lowSeq + shardCount) and 0xFFFF
-        lastFrameSentMs = System.currentTimeMillis()
         if (!firstFrameLogged) {
             firstFrameLogged = true
             ServerCore.log("视频首帧已发送：${frameData.size}B，${shardCount} 个 UDP 分片，目标 $peer")
@@ -418,5 +605,17 @@ class VideoStreamer(
     companion object {
         const val HEADER_SIZE = 32 // 12 RTP + 4 保留 + 16 NV_VIDEO_PACKET
         const val MAX_RTP_HEADER_SIZE = 16
+
+        /** 静止这么久先 invalidate 逼一帧（不动屏幕） */
+        const val POKE_AFTER_QUIET_MS = 1_500L
+
+        /** 连续这么久完全没有输出才唤醒屏幕：息屏但有画面时永远不点屏 */
+        const val WAKE_AFTER_QUIET_MS = 3_000L
+
+        /** 两次唤醒尝试的最小间隔 */
+        const val WAKE_RETRY_MS = 15_000L
+
+        /** 帧间隔超过该值即认为是「画面静止无输入」，不计入抖动 */
+        const val IDLE_GAP_MS = 300
     }
 }

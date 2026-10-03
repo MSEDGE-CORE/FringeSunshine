@@ -229,12 +229,47 @@ class StreamSession(
         // 新 ANNOUNCE 带来了新 rikey（config.rikeyHex 已被 applyAnnounceArgs 更新），
         // 控制流与音频加密都必须换新 key，否则解密全部失败
         riKey = parseRiKey(config.rikeyHex)
+        // 排干旧客户端积压在缓冲区的 ping：接收线程"稳定后停止接收"期间旧包持续入队，
+        // 不排干会把 videoPeer/audioPeer 绑到旧死端口，新客户端的 ping 永远没人理。
+        // 此时新客户端尚未 PLAY，缓冲里只有旧包，丢弃是安全的。
+        drainUdpSocket(videoSocket)
+        drainUdpSocket(audioSocket)
         startPingReceiver()
         // resume 视为一次新的连接：息屏则点亮（与首次启动同一策略），并刷新常亮锁
         com.wxz.sunshineserverandroid.input.CursorOverlay.acquireKeepAwake()
         // 源屏静止时编码器无输入，强制重挂表面逼出一帧 IDR 首帧
         videoStreamer?.forceFreshFrame()
         ServerCore.log("会话恢复：已重置视频/音频对端，等待新 ping")
+    }
+
+    /** 非阻塞排干 UDP 接收缓冲里的积压包（1ms 超时轮询直到读空） */
+    private fun drainUdpSocket(socket: DatagramSocket?) {
+        if (socket == null) return
+        val oldTimeout = try {
+            socket.soTimeout
+        } catch (_: Exception) {
+            return
+        }
+        var drained = 0
+        try {
+            socket.soTimeout = 1
+            val buf = ByteArray(64)
+            val packet = DatagramPacket(buf, buf.size)
+            while (true) {
+                socket.receive(packet)
+                drained++
+            }
+        } catch (_: java.net.SocketTimeoutException) {
+        } catch (_: Exception) {
+        } finally {
+            try {
+                socket.soTimeout = oldTimeout
+            } catch (_: Exception) {
+            }
+        }
+        if (drained > 0) {
+            ServerCore.log("已丢弃旧客户端积压 ping：${drained} 个")
+        }
     }
 
     fun stop() {

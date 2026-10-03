@@ -28,6 +28,7 @@ object CursorOverlay {
 
     private var windowManager: WindowManager? = null
     private var cursorView: CursorView? = null
+    @Volatile
     private var attached = false
 
     @Volatile
@@ -170,6 +171,9 @@ object CursorOverlay {
             cursorView?.invalidate()
         }
     }
+
+    /** 悬浮窗是否已挂载（未授权/挂载失败时为 false，调用方需降级逼帧手段） */
+    fun isAttached(): Boolean = attached
 
     fun detach() {
         handler.post {

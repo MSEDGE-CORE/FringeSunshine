@@ -274,27 +274,70 @@ class VideoStreamer(
      * （悬浮窗 poke 在缺权限设备上也失效）。把编码表面从虚拟屏摘下再挂回，
      * 走与首次会话完全相同的"切换表面"路径强制立刻合成一帧，并让它成为 IDR；
      * 合成帧会在新 ping 到达前被 pendingPayload 暂存，随后补发。
+     *
+     * 恢复瞬间屏幕可能还处熄灭态（acquireKeepAwake 的点亮是异步的）：
+     * 重挂发生在亮屏前会拿不到合成帧，这里安排两次延迟重挂兜底。
      */
     fun forceFreshFrame() {
         val s = surface ?: return
         val pd = ServerCore.projectionDisplay ?: return
-        try {
-            pendingPayload = null
-            noPeerLogged = false
-            firstFrameLogged = false
-            peerReadyMs = 0L
-            lastFrameSentMs = 0L
-            requestSync = true
-            pd.detach(s)
+        pendingPayload = null
+        noPeerLogged = false
+        firstFrameLogged = false
+        peerReadyMs = 0L
+        lastFrameSentMs = 0L
+        if (!relatchSurface(s, pd, requestIdr = true)) return
+        ServerCore.log("恢复串流：已重新挂载编码表面，强制源屏合成首帧（IDR）")
+        val interactive = try {
+            val pm = ServerCore.appContext
+                ?.getSystemService(android.content.Context.POWER_SERVICE) as? android.os.PowerManager
+            pm?.isInteractive == true
+        } catch (_: Exception) {
+            true
+        }
+        if (!interactive) {
+            Thread {
+                try {
+                    Thread.sleep(700L)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (stopped.get() || surface == null) return@Thread
+                relatchSurface(surface!!, ServerCore.projectionDisplay ?: return@Thread, requestIdr = true)
+                try {
+                    Thread.sleep(800L)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (stopped.get() || surface == null) return@Thread
+                relatchSurface(surface!!, ServerCore.projectionDisplay ?: return@Thread, requestIdr = true)
+            }.also { it.isDaemon = true }.start()
+        }
+    }
+
+    /**
+     * 把编码表面摘下再挂回，强制 SurfaceFlinger 对虚拟屏做一次合成。
+     * 对调用方要求输入源已"饿"（静止/息屏后亮起），活跃流上绝不能调：
+     * 挂回瞬间会丢一帧。每次重挂都请求 IDR，保证刚起步的客户端能立刻解码。
+     */
+    private fun relatchSurface(
+        s: Surface,
+        pd: com.wxz.sunshineserverandroid.stream.ProjectionDisplay,
+        requestIdr: Boolean
+    ): Boolean {
+        return try {
             val w = if (activeWidth > 0) activeWidth else configWidth()
             val h = if (activeHeight > 0) activeHeight else configHeight()
+            if (requestIdr) requestSync = true
+            pd.detach(s)
             if (!pd.attach(s, w, h, metrics.densityDpi)) {
-                ServerCore.log("恢复串流：重新挂载编码表面失败（投屏授权可能已失效）")
-                return
+                ServerCore.log("重新挂载编码表面失败（投屏授权可能已失效）")
+                return false
             }
-            ServerCore.log("恢复串流：已重新挂载编码表面，强制源屏合成首帧（IDR）")
+            true
         } catch (e: Exception) {
-            ServerCore.log("强制合成首帧失败：${e.javaClass.simpleName}: ${e.message}")
+            ServerCore.log("重新挂载编码表面异常：${e.javaClass.simpleName}: ${e.message}")
+            false
         }
     }
 
@@ -327,7 +370,15 @@ class VideoStreamer(
         // 过程中息屏不点亮：只在逼帧挽救合成，屏幕亮灭交给 acquireKeepAwake 的常亮标记
         if (quietMs >= POKE_AFTER_QUIET_MS && now - lastPokeMs >= 300L) {
             lastPokeMs = now
-            com.wxz.sunshineserverandroid.input.CursorOverlay.poke()
+            if (com.wxz.sunshineserverandroid.input.CursorOverlay.isAttached()) {
+                com.wxz.sunshineserverandroid.input.CursorOverlay.poke()
+            } else {
+                // 悬浮窗没挂上（本机无"显示在其他应用上层"权限，poke 是空操作）：
+                // 降级为重挂表面直接逼一次合成，否则静止画面会永远断流
+                val s = surface
+                val pd = ServerCore.projectionDisplay
+                if (s != null && pd != null) relatchSurface(s, pd, requestIdr = false)
+            }
         }
         if (quietMs >= 5_000L && now - lastStallLogMs >= 10_000L) {
             lastStallLogMs = now

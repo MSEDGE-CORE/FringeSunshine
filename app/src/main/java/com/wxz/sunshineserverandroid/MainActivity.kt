@@ -10,42 +10,50 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Accessibility
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.wxz.sunshineserverandroid.input.InputService
+import com.wxz.sunshineserverandroid.ui.PageScrollColumn
+import com.wxz.sunshineserverandroid.ui.SettingsItem
+import com.wxz.sunshineserverandroid.ui.SettingsSection
+import com.wxz.sunshineserverandroid.ui.applyImmersiveSystemBars
+import com.wxz.sunshineserverandroid.ui.rememberPageTick
 import com.wxz.sunshineserverandroid.ui.theme.SunshineServerAndroidTheme
 
 class MainActivity : ComponentActivity() {
@@ -53,7 +61,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        applyImmersiveSystemBars()
         ServerCore.init(applicationContext)
         setContent {
             SunshineServerAndroidTheme {
@@ -81,22 +89,45 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+/** 主页：标题栏「浏海阳光」+ 右上角 日志、设置（各自跳独立 Activity） */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainPage() {
     val context = LocalContext.current
-    var running by remember { mutableStateOf(ServerCore.running) }
-    var tick by remember { mutableIntStateOf(0) }
-    var waitingProjection by remember { mutableStateOf(false) }
+    val tick = rememberPageTick()
 
-    LaunchedEffect(Unit) {
-        ServerCore.onLog = { tick++ }
-        // 从设置页返回时没有日志事件，周期刷新以便状态按钮及时更新
-        while (true) {
-            kotlinx.coroutines.delay(2_000)
-            tick++
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        containerColor = MaterialTheme.colorScheme.background,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        topBar = {
+            TopAppBar(
+                title = { Text("浏海阳光") },
+                actions = {
+                    IconButton(onClick = { context.startActivity(Intent(context, LogActivity::class.java)) }) {
+                        Icon(Icons.AutoMirrored.Filled.List, contentDescription = "日志")
+                    }
+                    IconButton(onClick = { context.startActivity(Intent(context, SettingsActivity::class.java)) }) {
+                        Icon(Icons.Filled.Settings, contentDescription = "设置")
+                    }
+                }
+            )
         }
+    ) { padding ->
+        MainContent(padding, tick)
     }
+}
+
+/** 主页正文：服务状态 / 连接信息 / 配对 */
+@Composable
+private fun MainContent(
+    padding: PaddingValues,
+    tick: Int
+) {
+    val context = LocalContext.current
+    var running by remember { mutableStateOf(ServerCore.running) }
+    var waitingProjection by remember { mutableStateOf(false) }
+    LaunchedEffect(tick) { running = ServerCore.running }
 
     val projectionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -162,277 +193,124 @@ fun MainPage() {
         }
     }
 
-    Scaffold(
-        modifier = Modifier.fillMaxSize(),
-        topBar = { TopAppBar(title = { Text("投屏服务端") }) }
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 20.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            // 状态卡
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (running) MaterialTheme.colorScheme.primaryContainer
-                    else MaterialTheme.colorScheme.surfaceVariant
-                )
+    PageScrollColumn(padding) {
+        SettingsSection("Sunshine") {
+            Text(
+                if (running) "服务运行中" else "服务未启动",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold
+            )
+
+            Spacer(Modifier.height(4.dp))
+            Button(
+                onClick = {
+                    if (running) {
+                        context.startService(
+                            Intent(context, ServerService::class.java)
+                                .setAction(ServerService.ACTION_STOP)
+                        )
+                        running = false
+                    } else {
+                        requestStartupPermissions()
+                    }
+                },
+                colors = if (running) {
+                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                } else {
+                    ButtonDefaults.buttonColors()
+                },
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        if (running) "服务运行中" else "服务未启动",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text("Moonlight 协议（Sunshine 兼容子集）", style = MaterialTheme.typography.bodySmall)
-                    if (!running) {
+                Text(
+                    when {
+                        running -> "停止服务"
+                        waitingProjection -> "等待授权…"
+                        else -> "启动服务"
+                    }
+                )
+            }
+            if (!InputService.isEnabled()) {
+                SettingsItem(
+                    icon = Icons.Filled.Accessibility,
+                    title = "无障碍触控服务未开启",
+                    subtitle = "远程控制（触摸/鼠标/按键注入）需要它，点击前往设置",
+                    onClick = { context.startActivity(Intent(context, SettingsActivity::class.java)) }
+                )
+            }
+        }
+
+        if (running) {
+            SettingsSection("连接") {
+                val ips = remember(tick) { ServerCore.localIps() }
+                if (ips.isEmpty()) {
+                    Text("未检测到局域网地址，请连接 Wi-Fi", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    for ((index, ip) in ips.withIndex()) {
                         Text(
-                            "启动后可在同一局域网的 Moonlight 客户端（或自研鸿蒙客户端）中添加本机",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            if (index == 0) "地址：$ip（客户端填这个）" else "地址：$ip",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (index == 0) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
                         )
                     }
                 }
+                Text(
+                    "端口：HTTP ${com.wxz.sunshineserverandroid.net.NvHttpServer.PORT} · " +
+                        "RTSP ${com.wxz.sunshineserverandroid.net.RtspServer.PORT} · " +
+                        "视频 47998 · 控制 47999 · 音频 48000",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
 
-            // 显示名设置
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("显示名", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            SettingsSection("配对") {
+                val awaiting = remember(tick) { ServerCore.awaitingPin }
+                if (awaiting) {
+                    val device = remember(tick) { ServerCore.pendingPairDevice }
                     Text(
-                        "Moonlight 客户端列表中显示的主机名。serverinfo 立即生效；mDNS 广播名需重启服务后生效。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        "收到配对请求：$device",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary
                     )
-                    var nameInput by remember { mutableStateOf(ServerCore.hostName) }
-                    androidx.compose.foundation.layout.Row(
+                    Text(
+                        "请输入 Moonlight 客户端上显示的 PIN",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    var pinInput by remember(awaiting) { mutableStateOf("") }
+                    Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        androidx.compose.material3.OutlinedTextField(
-                            value = nameInput,
-                            onValueChange = { if (it.length <= 63) nameInput = it },
-                            label = { Text("主机名") },
+                        OutlinedTextField(
+                            value = pinInput,
+                            onValueChange = { if (it.length <= 4 && it.all(Char::isDigit)) pinInput = it },
+                            label = { Text("PIN") },
                             singleLine = true,
                             modifier = Modifier.weight(1f)
                         )
                         Button(
                             onClick = {
-                                ServerCore.setHostName(nameInput)
-                                Toast.makeText(context, "显示名已保存：${ServerCore.hostName}", Toast.LENGTH_SHORT).show()
+                                if (pinInput.length == 4) {
+                                    ServerCore.submitPin(pinInput)
+                                    Toast.makeText(context, "已提交 PIN：$pinInput", Toast.LENGTH_SHORT).show()
+                                }
                             },
-                            enabled = nameInput.isNotBlank() && nameInput.trim() != ServerCore.hostName
+                            enabled = pinInput.length == 4
                         ) {
-                            Text("保存")
+                            Text("确认")
                         }
-                    }
-                }
-            }
-
-            // 连接信息
-            if (running) {
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("连接信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        val ips = remember(tick) { ServerCore.localIps() }
-                        if (ips.isEmpty()) {
-                            Text("未检测到局域网地址，请连接 Wi-Fi", style = MaterialTheme.typography.bodyMedium)
-                        } else {
-                            for ((index, ip) in ips.withIndex()) {
-                                Text(
-                                    if (index == 0) "地址：$ip（客户端填这个）" else "地址：$ip",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = if (index == 0) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                    }
-                                )
-                            }
-                        }
-                        Text(
-                            "端口：HTTP ${com.wxz.sunshineserverandroid.net.NvHttpServer.PORT} · " +
-                                "RTSP ${com.wxz.sunshineserverandroid.net.RtspServer.PORT} · " +
-                                "视频 47998 · 控制 47999 · 音频 48000",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("配对", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        val awaiting = remember(tick) { ServerCore.awaitingPin }
-                        if (awaiting) {
-                            val device = remember(tick) { ServerCore.pendingPairDevice }
-                            Text(
-                                "收到配对请求：$device",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            Text(
-                                "请输入 Moonlight 客户端上显示的 PIN",
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            var pinInput by remember(awaiting) { mutableStateOf("") }
-                            androidx.compose.foundation.layout.Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
-                            ) {
-                                androidx.compose.material3.OutlinedTextField(
-                                    value = pinInput,
-                                    onValueChange = { if (it.length <= 4 && it.all(Char::isDigit)) pinInput = it },
-                                    label = { Text("PIN") },
-                                    singleLine = true,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Button(
-                                    onClick = {
-                                        if (pinInput.length == 4) {
-                                            ServerCore.submitPin(pinInput)
-                                            Toast.makeText(context, "已提交 PIN：$pinInput", Toast.LENGTH_SHORT).show()
-                                        }
-                                    },
-                                    enabled = pinInput.length == 4
-                                ) {
-                                    Text("确认")
-                                }
-                            }
-                        } else {
-                            Text(
-                                "在 Moonlight 客户端添加本主机并发起配对时，客户端会显示一个 4 位 PIN，届时在此输入以完成配对",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        val paired = remember(tick) { ServerCore.pairedClientSnapshot() }
-                        Text(
-                            "已配对设备（${paired.size}）",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                        if (paired.isEmpty()) {
-                            Text(
-                                "尚未配对 Moonlight 设备",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        } else {
-                            for (clientId in paired) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text("Moonlight 设备", style = MaterialTheme.typography.bodyMedium)
-                                        Text(
-                                            clientId,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                    }
-                                    OutlinedButton(
-                                        onClick = {
-                                            ServerCore.removePairedClient(clientId)
-                                            tick++
-                                        }
-                                    ) {
-                                        Text("解除")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 按钮
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (!running) {
-                    Button(
-                        onClick = { requestStartupPermissions() },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(if (waitingProjection) "等待授权…" else "启动服务")
                     }
                 } else {
-                    Button(
-                        onClick = {
-                            context.startService(
-                                Intent(context, ServerService::class.java)
-                                    .setAction(ServerService.ACTION_STOP)
-                            )
-                            running = false
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error
-                        ),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("停止服务")
-                    }
-                }
-            }
-
-            // 无障碍开关
-            val accessibilityOn = InputService.isEnabled()
-            OutlinedButton(
-                onClick = {
-                    context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(if (accessibilityOn) "无障碍触控服务：已开启" else "开启无障碍触控服务（远程控制需要）")
-            }
-
-            // 鼠标模式的可见光标
-            val canOverlay = android.provider.Settings.canDrawOverlays(context)
-            OutlinedButton(
-                onClick = {
-                    context.startActivity(
-                        Intent(
-                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                            android.net.Uri.parse("package:" + context.packageName)
-                        )
+                    Text(
+                        "在 Moonlight 客户端添加本主机并发起配对时，客户端会显示一个 4 位 PIN，届时在此输入以完成配对",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(if (canOverlay) "鼠标光标显示：已授权" else "开启悬浮光标（鼠标模式显示指针）")
-            }
-
-            // 日志
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(20.dp)) {
-                    Text("日志", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(8.dp))
-                    val logs = remember(tick) { ServerCore.snapshotLogs().takeLast(30) }
-                    if (logs.isEmpty()) {
-                        Text("暂无日志", style = MaterialTheme.typography.bodySmall)
-                    } else {
-                        for (line in logs) {
-                            Text(
-                                line,
-                                style = MaterialTheme.typography.bodySmall,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    }
                 }
             }
-            Spacer(Modifier.height(24.dp))
         }
     }
 }

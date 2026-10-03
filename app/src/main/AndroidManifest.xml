@@ -46,6 +46,18 @@
             </intent-filter>
         </activity>
 
+        <!-- 日志/设置：标题栏图标点进来的独立 Activity（不再是页内切换） -->
+        <activity
+            android:name=".LogActivity"
+            android:exported="false"
+            android:label="日志"
+            android:theme="@style/Theme.SunshineServerAndroid" />
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="设置"
+            android:theme="@style/Theme.SunshineServerAndroid" />
+
         <service
             android:name=".ServerService"
             android:exported="false"

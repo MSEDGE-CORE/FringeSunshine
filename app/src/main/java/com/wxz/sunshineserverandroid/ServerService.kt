@@ -80,7 +80,7 @@ class ServerService : Service(), NvHttpServer.LaunchListener {
         val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) {
             manager.createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "投屏服务", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL_ID, "Sunshine", NotificationManager.IMPORTANCE_LOW)
             )
         }
         val stopIntent = PendingIntent.getService(
@@ -94,8 +94,8 @@ class ServerService : Service(), NvHttpServer.LaunchListener {
             PendingIntent.FLAG_IMMUTABLE
         )
         val notification: Notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("投屏服务运行中")
-            .setContentText("Moonlight 协议服务端已就绪")
+            .setContentTitle("Sunshine")
+            .setContentText("运行中")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(openIntent)
             .addAction(Notification.Action.Builder(null, "停止", stopIntent).build())

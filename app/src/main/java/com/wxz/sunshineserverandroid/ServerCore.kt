@@ -18,6 +18,7 @@ object ServerCore {
     private const val KEY_UNIQUE_ID = "unique_id"
     private const val KEY_PAIRED = "paired_clients"
     private const val KEY_HOST_NAME = "host_name"
+    private const val KEY_CURSOR_ENABLED = "cursor_enabled"
 
     lateinit var appContext: Context
         private set
@@ -48,6 +49,18 @@ object ServerCore {
         appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putString(KEY_HOST_NAME, trimmed).apply()
         log("显示名已设置为：$trimmed（mDNS 广播名重启服务后生效）")
+    }
+
+    /** 鼠标模式是否显示可见光标（设置页手动开关） */
+    @Volatile
+    var cursorEnabled: Boolean = true
+        private set
+
+    fun setCursorEnabled(on: Boolean) {
+        cursorEnabled = on
+        appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_CURSOR_ENABLED, on).apply()
+        log("光标显示已${if (on) "开启" else "关闭"}")
     }
 
     /** 默认显示名：设备型号（保证两台手机同时广播时 mDNS 服务名不冲突） */
@@ -86,7 +99,19 @@ object ServerCore {
 
     private val logLock = Any()
     private val logBuffer = ArrayDeque<String>()
-    var onLog: (() -> Unit)? = null
+    /**
+     * 日志观察者列表：主界面、日志页等各自注册/注销，互不覆盖
+     * （原来是单个 onLog 回调，页面一多后进入日志页会把主界面的刷新回调顶掉）
+     */
+    private val logListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    fun addLogListener(listener: () -> Unit) {
+        logListeners.add(listener)
+    }
+
+    fun removeLogListener(listener: () -> Unit) {
+        logListeners.remove(listener)
+    }
 
     fun init(context: Context) {
         if (::appContext.isInitialized) return
@@ -105,6 +130,7 @@ object ServerCore {
         }
         prefs.getString(KEY_PAIRED, "")?.split(",")?.filter { it.isNotBlank() }?.let { pairedClients.addAll(it) }
         hostName = prefs.getString(KEY_HOST_NAME, null) ?: defaultHostName()
+        cursorEnabled = prefs.getBoolean(KEY_CURSOR_ENABLED, true)
     }
 
     /**
@@ -205,7 +231,7 @@ object ServerCore {
             logBuffer.addLast(line)
             while (logBuffer.size > 200) logBuffer.removeFirst()
         }
-        onLog?.invoke()
+        for (listener in logListeners) listener()
     }
 
     fun snapshotLogs(): List<String> = synchronized(logLock) { logBuffer.toList() }

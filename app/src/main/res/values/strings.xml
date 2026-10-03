@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">投屏服务端</string>
+    <string name="app_name">浏海阳光</string>
     <string name="input_service_label">投屏触控服务</string>
     <string name="input_service_desc">接收 Moonlight 协议客户端发来的触摸、鼠标与按键事件并注入到本机，用于远程控制</string>
 </resources>

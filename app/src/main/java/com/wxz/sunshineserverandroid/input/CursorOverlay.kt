@@ -33,9 +33,13 @@ object CursorOverlay {
     @Volatile
     private var permissionWarned = false
 
-    /** 绝对鼠标移动：把光标挪到 (x, y)（屏幕像素） */
+    /** 绝对鼠标移动：把光标挪到 (x, y)（屏幕像素）；设置页关闭光标后直接不画 */
     fun moveTo(x: Float, y: Float) {
         handler.post {
+            if (!ServerCore.cursorEnabled) {
+                cursorView?.setCursor(0f, 0f, false)
+                return@post
+            }
             val context = ServerCore.appContext ?: return@post
             if (!Settings.canDrawOverlays(context)) {
                 warnOnce(context)

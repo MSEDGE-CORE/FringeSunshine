@@ -63,7 +63,12 @@ object CursorOverlay {
     /** 会话期间保住 CPU，否则息屏后设备休眠，下面的重新点亮看门狗根本没机会跑 */
     private var cpuLock: android.os.PowerManager.WakeLock? = null
 
-    /** 会话开始：窗口挂 FLAG_KEEP_SCREEN_ON，并尽力把已经熄灭的屏幕点亮 */
+    /**
+     * 会话开始：窗口挂 FLAG_KEEP_SCREEN_ON（只拦「正在亮着的屏超时熄灭」，不主动点屏）。
+     *
+     * **不主动唤醒**：息屏时若虚拟屏仍在出帧（客户端有画面），把屏点着纯属多余；
+     * 真的断了画面由 VideoStreamer.pokeSourceIfNeeded 判定后再点（见 WAKE_AFTER_QUIET_MS）。
+     */
     fun acquireKeepAwake() {
         handler.post {
             val context = ServerCore.appContext ?: return@post
@@ -76,18 +81,11 @@ object CursorOverlay {
                             acquire(60 * 60 * 1000L)
                         }
                 }
-                if (wakeLock == null) {
-                    @Suppress("DEPRECATION")
-                    val wl = pm.newWakeLock(
-                        android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
-                            android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP,
-                        "sunshine:keep-screen-on"
-                    )
-                    wl.setReferenceCounted(false)
-                    wl.acquire(30 * 60 * 1000L)
-                    wakeLock = wl
-                }
-                ServerCore.log("串流开始：屏幕${if (pm.isInteractive) "亮着" else "已熄灭，尝试唤醒"}")
+                wakeLock = null
+                ServerCore.log(
+                    "串流开始：屏幕${if (pm.isInteractive) "亮着" else "已熄灭"}" +
+                        if (pm.isInteractive) "" else "（有画面则不主动唤醒）"
+                )
             } catch (e: Exception) {
                 ServerCore.log("唤醒屏幕失败：${e.javaClass.simpleName}")
             }
@@ -148,9 +146,9 @@ object CursorOverlay {
     }
 
     /**
-     * FLAG_KEEP_SCREEN_ON 拦得住系统超时息屏，但拦不住用户按电源键。
-     * 串流中若屏幕已熄，重新 acquire（ACQUIRE_CAUSES_WAKEUP）尝试点亮；
-     * 息屏后镜像虚拟屏不再合成，编码器会彻底没有输入，客户端只能黑屏。
+     * 只在「确实没有画面」时才点屏：FLAG_KEEP_SCREEN_ON 拦得住系统超时息屏，但拦不住电源键。
+     * 调用方（VideoStreamer）会先逼帧、并确认连续数秒都没有输出才会走到这里，
+     * 所以息屏且画面仍在流的情况下不会被点亮。
      */
     fun ensureAwake() {
         handler.post {

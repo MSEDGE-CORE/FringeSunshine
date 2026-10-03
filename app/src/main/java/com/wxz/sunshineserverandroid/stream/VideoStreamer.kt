@@ -105,7 +105,6 @@ class VideoStreamer(
     private var lastFrameSentMs = 0L
     private var lastPokeMs = 0L
     private var lastStallLogMs = 0L
-    private var lastWakeMs = 0L
 
     override fun run() {
         try {
@@ -287,15 +286,10 @@ class VideoStreamer(
         val last = lastFrameSentMs
         val quietMs = now - if (last != 0L) last else peerReadyMs
         if (quietMs < POKE_AFTER_QUIET_MS) return
-        // 先只逼一帧合成，不动屏幕
-        if (now - lastPokeMs >= 300L) {
+        // 过程中息屏不点亮：只在逼帧挽救合成，屏幕亮灭交给 acquireKeepAwake 的常亮标记
+        if (quietMs >= POKE_AFTER_QUIET_MS && now - lastPokeMs >= 300L) {
             lastPokeMs = now
             com.wxz.sunshineserverandroid.input.CursorOverlay.poke()
-        }
-        // 有画面就不唤醒：只有连续这么久一点输出都没有（逼帧也救不回来），才认定源屏真的停了
-        if (quietMs >= WAKE_AFTER_QUIET_MS && now - lastWakeMs >= WAKE_RETRY_MS) {
-            lastWakeMs = now
-            com.wxz.sunshineserverandroid.input.CursorOverlay.ensureAwake()
         }
         if (quietMs >= 5_000L && now - lastStallLogMs >= 10_000L) {
             lastStallLogMs = now
@@ -645,12 +639,6 @@ class VideoStreamer(
 
         /** 静止这么久先 invalidate 逼一帧（不动屏幕） */
         const val POKE_AFTER_QUIET_MS = 1_500L
-
-        /** 连续这么久完全没有输出才唤醒屏幕：息屏但有画面时永远不点屏 */
-        const val WAKE_AFTER_QUIET_MS = 3_000L
-
-        /** 两次唤醒尝试的最小间隔 */
-        const val WAKE_RETRY_MS = 15_000L
 
         /** 帧间隔超过该值即认为是「画面静止无输入」，不计入抖动 */
         const val IDLE_GAP_MS = 300

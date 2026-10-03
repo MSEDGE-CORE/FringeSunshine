@@ -105,34 +105,24 @@ class ProjectionDisplay(private val projection: MediaProjection) {
         }
     }
 
-    /** API 35+ 用新参数序重载；33/34 的旧重载已从 compileSdk 37 移除，走反射 */
+    /**
+     * API 33/34/37 的公开签名一致：(name, w, h, dpi, flags, surface, callback, handler)。
+     * 曾在 API<35 分支反射旧的 (surface 在 flags 前) 签名，Android 14 上必然
+     * NoSuchMethodException → 虚拟屏挂载失败，直接用唯一可用重载即可。
+     */
     private fun createVirtualDisplay(
         surface: Surface,
         width: Int,
         height: Int,
         densityDpi: Int
-    ): VirtualDisplay? {
-        val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
-        return if (android.os.Build.VERSION.SDK_INT >= 35) {
-            projection.createVirtualDisplay(
-                "sunshine-video", width, height, densityDpi, flags, surface, null, null
-            )
-        } else {
-            val method = MediaProjection::class.java.getMethod(
-                "createVirtualDisplay",
-                String::class.java,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                Int::class.javaPrimitiveType,
-                Surface::class.java,
-                Int::class.javaPrimitiveType,
-                VirtualDisplay.Callback::class.java,
-                Handler::class.java
-            )
-            method.invoke(
-                projection, "sunshine-video", width, height, densityDpi,
-                surface, flags, null, null
-            ) as? VirtualDisplay
-        }
-    }
+    ): VirtualDisplay? = projection.createVirtualDisplay(
+        "sunshine-video",
+        width,
+        height,
+        densityDpi,
+        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+        surface,
+        null,
+        null
+    )
 }

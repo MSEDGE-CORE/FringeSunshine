@@ -151,26 +151,48 @@ class VideoStreamer(
         statsWindowStartMs = System.currentTimeMillis()
 
         val bitrateKbps = session.config.bitrateKbps * 1000
-        // Sunshine 用 CBR：VBR 在高动态画面会冲到 11Mbps+，超过 WiFi 承载即丢包卡顿。
+        // 配置阶梯：优化参数+CBR → 优化参数+VBR → 纯基础参数。
+        // Sunshine 用 CBR（VBR 在高动态画面会冲到 11Mbps+，超 WiFi 承载即丢包卡顿）；
+        // 优化参数若被某个编码器拒绝，逐级退化而不是整个串流起不来。
+        val attempts = listOf(
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR to true,
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR to true,
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR to false,
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR to false
+        )
         var codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        try {
-            codec.configure(
-                buildFormat(width, height, fps, bitrateKbps,
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR),
-                null, null, MediaCodec.CONFIGURE_FLAG_ENCODE
-            )
-        } catch (e: Exception) {
-            ServerCore.log("编码器不支持 CBR，回退 VBR：${e.javaClass.simpleName}: ${e.message}")
+        var configured = false
+        for ((mode, enhanced) in attempts) {
+            try {
+                codec.configure(
+                    buildFormat(width, height, fps, bitrateKbps, mode, enhanced),
+                    null, null, MediaCodec.CONFIGURE_FLAG_ENCODE
+                )
+                configured = true
+                if (!enhanced) {
+                    ServerCore.log("编码器不接受优化参数，已回退基础配置")
+                } else if (mode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) {
+                    ServerCore.log("编码器不支持 CBR，回退 VBR")
+                }
+                break
+            } catch (e: Exception) {
+                ServerCore.log(
+                    "编码器 configure 失败（enhanced=$enhanced mode=$mode）：" +
+                        "${e.javaClass.simpleName}: ${e.message}"
+                )
+                try {
+                    codec.release()
+                } catch (_: Exception) {
+                }
+                codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            }
+        }
+        if (!configured) {
             try {
                 codec.release()
             } catch (_: Exception) {
             }
-            codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            codec.configure(
-                buildFormat(width, height, fps, bitrateKbps,
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR),
-                null, null, MediaCodec.CONFIGURE_FLAG_ENCODE
-            )
+            throw IllegalStateException("编码器配置失败（CBR/VBR + 优化/基础参数均被拒绝）")
         }
         encoder = codec
         val inputSurface = codec.createInputSurface()
@@ -367,15 +389,30 @@ class VideoStreamer(
         if (ivN < ivBuf.size) ivN++
     }
 
-    private fun buildFormat(width: Int, height: Int, fps: Int, bitrateBps: Int, bitrateMode: Int): MediaFormat =
+    private fun buildFormat(
+        width: Int,
+        height: Int,
+        fps: Int,
+        bitrateBps: Int,
+        bitrateMode: Int,
+        enhanced: Boolean
+    ): MediaFormat =
         MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 5)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, IDR_INTERVAL_S)
             setInteger(MediaFormat.KEY_BITRATE_MODE, bitrateMode)
-            // 虚拟屏按屏幕刷新率（120Hz+）出帧，限到协商帧率；在编码前生效
+            // 虚拟屏按屏幕刷新率（本机 120Hz）出帧，限到协商帧率；在编码前生效
             setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
+            if (enhanced) {
+                // 硬编按这个速率准备线程/资源：输入突发时不排队，输出更均匀
+                setInteger(MediaFormat.KEY_OPERATING_RATE, fps * 2)
+                // 禁 B 帧重排：客户端少 1~2 帧重排延迟与解码抖动
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                // 低延迟模式（API30+，minSdk 33）：更浅的输入/输出缓冲
+                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
         }
 
     private fun configWidth(): Int {
@@ -617,5 +654,8 @@ class VideoStreamer(
 
         /** 帧间隔超过该值即认为是「画面静止无输入」，不计入抖动 */
         const val IDLE_GAP_MS = 300
+
+        /** 关键帧间隔（秒）：丢包后客户端要么等它、要么主动请求 IDR，调小=卡顿恢复更快、码率峰值略升 */
+        const val IDR_INTERVAL_S = 3
     }
 }

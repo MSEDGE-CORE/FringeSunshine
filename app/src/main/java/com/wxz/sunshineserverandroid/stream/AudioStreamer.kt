@@ -31,6 +31,29 @@ class AudioStreamer(
     private var timestamp = 0
     private var encryptionWarningLogged = false
 
+    /** 客户端离开即停：暂停 AudioPlaybackCapture（编码器保持存活等 resume） */
+    @Volatile
+    private var capturePaused = false
+
+    /** 客户端离开：停录音；音频线程进入 200ms 轮询等待，避免 read<=0 热转 */
+    fun pauseCapture() {
+        capturePaused = true
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) {
+        }
+    }
+
+    /** resume：重新开录（AudioRecord stop 后可反复 startRecording） */
+    fun resumeCapture() {
+        capturePaused = false
+        try {
+            audioRecord?.startRecording()
+        } catch (e: Exception) {
+            ServerCore.log("恢复音频采集失败: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
     companion object {
         const val SAMPLE_RATE = 48_000
         const val CHANNELS = 2
@@ -90,6 +113,15 @@ class AudioStreamer(
         val info = MediaCodec.BufferInfo()
 
         while (!stopped.get()) {
+            if (capturePaused) {
+                drainOutput(codec, info)
+                try {
+                    Thread.sleep(200)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                continue
+            }
             // 读 PCM
             val read = audioRecord?.read(pcmBuf, 0, pcmBuf.size) ?: -1
             if (read <= 0) {

@@ -112,6 +112,16 @@ class VideoStreamer(
     @Volatile
     private var activeHeight = 0
 
+    /**
+     * 客户端离开即停：暂停期间编码表面已从虚拟屏分离（不再捕获），
+     * 门控 flush/poke，防止 poke 降级把表面又挂回去。
+     */
+    @Volatile
+    private var capturePaused = false
+
+    /** 重挂与暂停的互斥锁：pauseCapture(ENet 线程) 与 relatchSurface(视频线程) 的 detach+attach 必须原子化 */
+    private val surfaceLatchLock = Any()
+
     override fun run() {
         try {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
@@ -225,8 +235,10 @@ class VideoStreamer(
                 codec.setParameters(params)
             }
 
-            flushPendingFrame()
-            pokeSourceIfNeeded()
+            if (!capturePaused) {
+                flushPendingFrame()
+                pokeSourceIfNeeded()
+            }
 
             val index = codec.dequeueOutputBuffer(bufferInfo, 10_000)
             if (index == MediaCodec.INFO_TRY_AGAIN_LATER) continue
@@ -316,6 +328,27 @@ class VideoStreamer(
     }
 
     /**
+     * 客户端离开即停：把编码表面从常驻虚拟屏分离，SurfaceFlinger 不再为它合成，
+     * 编码器无输入（保持存活等 resume，不冷启动）。常亮锁由 StreamSession 释放。
+     */
+    fun pauseCapture() {
+        capturePaused = true
+        val s = surface ?: return
+        synchronized(surfaceLatchLock) {
+            try {
+                ServerCore.projectionDisplay?.detach(s)
+            } catch (e: Exception) {
+                ServerCore.log("分离编码表面异常：${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+    }
+
+    /** resume：恢复 flush/poke 门控；表面的重新挂载由随后的 [forceFreshFrame] 完成 */
+    fun resumeCapture() {
+        capturePaused = false
+    }
+
+    /**
      * 把编码表面摘下再挂回，强制 SurfaceFlinger 对虚拟屏做一次合成。
      * 对调用方要求输入源已"饿"（静止/息屏后亮起），活跃流上绝不能调：
      * 挂回瞬间会丢一帧。每次重挂都请求 IDR，保证刚起步的客户端能立刻解码。
@@ -325,19 +358,21 @@ class VideoStreamer(
         pd: com.wxz.sunshineserverandroid.stream.ProjectionDisplay,
         requestIdr: Boolean
     ): Boolean {
-        return try {
-            val w = if (activeWidth > 0) activeWidth else configWidth()
-            val h = if (activeHeight > 0) activeHeight else configHeight()
-            if (requestIdr) requestSync = true
-            pd.detach(s)
-            if (!pd.attach(s, w, h, metrics.densityDpi)) {
-                ServerCore.log("重新挂载编码表面失败（投屏授权可能已失效）")
-                return false
+        synchronized(surfaceLatchLock) {
+            return try {
+                val w = if (activeWidth > 0) activeWidth else configWidth()
+                val h = if (activeHeight > 0) activeHeight else configHeight()
+                if (requestIdr) requestSync = true
+                pd.detach(s)
+                if (!pd.attach(s, w, h, metrics.densityDpi)) {
+                    ServerCore.log("重新挂载编码表面失败（投屏授权可能已失效）")
+                    return false
+                }
+                true
+            } catch (e: Exception) {
+                ServerCore.log("重新挂载编码表面异常：${e.javaClass.simpleName}: ${e.message}")
+                false
             }
-            true
-        } catch (e: Exception) {
-            ServerCore.log("重新挂载编码表面异常：${e.javaClass.simpleName}: ${e.message}")
-            false
         }
     }
 

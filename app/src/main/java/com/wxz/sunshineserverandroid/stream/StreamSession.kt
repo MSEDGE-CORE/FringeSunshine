@@ -217,6 +217,20 @@ class StreamSession(
     }
 
     /**
+     * 客户端离开（控制通道断开）即暂停捕获——对齐原版 Sunshine 的"离开即停"语义：
+     * 分离编码表面（虚拟屏停止合成）、停音频采集、放开常亮锁（屏幕可正常超时息屏）。
+     * 会话对象/编码器/UDP socket 全部保留，resume 时由 [prepareForResume] 热恢复。
+     */
+    fun pauseCapture() {
+        videoPeer = null
+        audioPeer = null
+        videoStreamer?.pauseCapture()
+        audioStreamer?.pauseCapture()
+        com.wxz.sunshineserverandroid.input.CursorOverlay.releaseKeepAwake()
+        ServerCore.log("客户端离开：已暂停屏幕捕获与音频采集，等待 resume")
+    }
+
+    /**
      * 客户端断开后重新协商（resume 的二次 ANNOUNCE）：客户端重新建了 UDP socket，
      * 源端口大概率变了，必须清掉旧对端并重新监听 ping，否则视频/音频会一直发往死地址。
      */
@@ -235,6 +249,9 @@ class StreamSession(
         drainUdpSocket(videoSocket)
         drainUdpSocket(audioSocket)
         startPingReceiver()
+        // "离开即停"的热恢复：解除暂停门控、恢复音频采集（表面重挂由 forceFreshFrame 完成）
+        videoStreamer?.resumeCapture()
+        audioStreamer?.resumeCapture()
         // resume 视为一次新的连接：息屏则点亮（与首次启动同一策略），并刷新常亮锁
         com.wxz.sunshineserverandroid.input.CursorOverlay.acquireKeepAwake()
         // 源屏静止时编码器无输入，强制重挂表面逼出一帧 IDR 首帧
@@ -389,9 +406,9 @@ class StreamSession(
         const val SESSION_CONNECT_TIMEOUT_MS = 30_000L
 
         /**
-         * 客户端 ENet 断开后会话的保留时长（Sunshine 同款语义：主机侧保持应用运行，
-         * 客户端随时 resume 重连）。Moonlight 的 resume 是"先断旧 ENet 再发 /resume"，
-         * 保留期内 /resume 才有会话可恢复。
+         * 客户端 ENet 断开后会话的保留时长。断开瞬间即暂停捕获（对齐原版 Sunshine 的
+         * "离开即停"），但会话对象/编码器/socket 保留——Moonlight 的 resume 是"先断旧
+         * ENet 再发 /resume"，保留期内 /resume 才能热恢复（无需重建编码器）。过期回收。
          */
         const val RESUME_GRACE_MS = 60_000L
 

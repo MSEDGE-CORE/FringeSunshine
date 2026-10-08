@@ -27,8 +27,10 @@ class ControlServer(private val session: StreamSession) {
             session.controlConnected = false
             if (session.isRunning && session.clientGoneSinceMs == 0L) {
                 session.clientGoneSinceMs = System.currentTimeMillis()
+                // 离开即停：立即暂停屏幕捕获与音频采集（编码器/会话保留供 resume 热恢复）
+                session.pauseCapture()
                 ServerCore.log(
-                    "控制通道断开，会话保留 ${StreamSession.RESUME_GRACE_MS / 1000}s 供客户端恢复"
+                    "控制通道断开，已暂停捕获，会话保留 ${StreamSession.RESUME_GRACE_MS / 1000}s 供客户端恢复"
                 )
             }
         }

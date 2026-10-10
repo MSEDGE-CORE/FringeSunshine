@@ -18,11 +18,19 @@ import com.wxz.sunshineserverandroid.ServerCore
  * 鼠标模式下的可见光标。
  *
  * 绝对鼠标坐标只更新一个虚拟指针，本机屏幕上没有任何可见反馈；
- * 这里加一层 TYPE_APPLICATION_OVERLAY 全屏透明窗口画一个箭头指针，
+ * 这里加一层 TYPE_APPLICATION_OVERLAY 的**小窗口**（仅光标箭头大小）画箭头指针，
  * 该窗口会被 MediaProjection 一并采集，因此客户端画面里也能看到光标。
  * 需要"显示在其他应用上层"权限。
+ *
+ * 窗口必须保持小尺寸：全屏 overlay 会让 ROM 判定"屏幕被遮挡"
+ * （ColorOS 弹提示、系统区域行为异常），常驻会话期间尤其明显。
+ * 箭头热点在 (0,0)，窗口左角即光标位置，moveTo 只更新 x/y。
  */
 object CursorOverlay {
+
+    /** 箭头路径范围 x:0..18 y:0..27，加 2px 描边余量 */
+    private const val WINDOW_W = 22
+    private const val WINDOW_H = 32
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -34,11 +42,11 @@ object CursorOverlay {
     @Volatile
     private var permissionWarned = false
 
-    /** 绝对鼠标移动：把光标挪到 (x, y)（屏幕像素）；设置页关闭光标后直接不画 */
+    /** 绝对鼠标移动：把光标窗口挪到 (x, y)（屏幕像素）；设置页关闭光标后直接不画 */
     fun moveTo(x: Float, y: Float) {
         handler.post {
             if (!ServerCore.cursorEnabled) {
-                cursorView?.setCursor(0f, 0f, false)
+                cursorView?.setCursor(false)
                 return@post
             }
             val context = ServerCore.appContext ?: return@post
@@ -47,14 +55,31 @@ object CursorOverlay {
                 return@post
             }
             if (!ensureAttached(context)) return@post
-            cursorView?.setCursor(x, y, true)
+            cursorView?.setCursor(true)
+            positionWindow(x, y)
+        }
+    }
+
+    /** 窗口位置 = 光标位置（热点在窗口左角），坐标没变就不触发重排 */
+    private fun positionWindow(x: Float, y: Float) {
+        val v = cursorView ?: return
+        val wm = windowManager ?: return
+        val params = v.layoutParams as? WindowManager.LayoutParams ?: return
+        val nx = Math.round(x)
+        val ny = Math.round(y)
+        if (params.x == nx && params.y == ny) return
+        params.x = nx
+        params.y = ny
+        try {
+            wm.updateViewLayout(v, params)
+        } catch (_: Exception) {
         }
     }
 
     /** 切回触摸模式或会话结束：隐藏光标（窗口保留，避免反复 add/remove 闪烁） */
     fun hide() {
         handler.post {
-            cursorView?.setCursor(0f, 0f, false)
+            cursorView?.setCursor(false)
         }
     }
 
@@ -127,7 +152,7 @@ object CursorOverlay {
         }
     }
 
-    /** 会话结束：放开常亮，允许系统按超时息屏 */
+    /** 会话暂停/结束：放开常亮，并摘除悬浮窗——无串流期间系统里不留任何 overlay */
     fun releaseKeepAwake() {
         handler.post {
             try {
@@ -137,9 +162,7 @@ object CursorOverlay {
             }
             wakeLock = null
             cpuLock = null
-            val context = ServerCore.appContext ?: return@post
-            val v = cursorView ?: return@post
-            setKeepScreenOnFlag(context, false, v)
+            detachInternal()
         }
     }
 
@@ -176,19 +199,22 @@ object CursorOverlay {
     fun isAttached(): Boolean = attached
 
     fun detach() {
-        handler.post {
-            val wm = windowManager
-            val v = cursorView
-            if (attached && wm != null && v != null) {
-                try {
-                    wm.removeViewImmediate(v)
-                } catch (_: Exception) {
-                }
+        handler.post { detachInternal() }
+    }
+
+    /** 摘除悬浮窗：必须在主线程调用（releaseKeepAwake/detach 已在 handler 内） */
+    private fun detachInternal() {
+        val wm = windowManager
+        val v = cursorView
+        if (attached && wm != null && v != null) {
+            try {
+                wm.removeViewImmediate(v)
+            } catch (_: Exception) {
             }
-            attached = false
-            cursorView = null
-            windowManager = null
         }
+        attached = false
+        cursorView = null
+        windowManager = null
     }
 
     private fun warnOnce(context: Context) {
@@ -203,8 +229,8 @@ object CursorOverlay {
             val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val view = CursorView(context)
             val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
+                WINDOW_W,
+                WINDOW_H,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -215,11 +241,11 @@ object CursorOverlay {
                 gravity = Gravity.TOP or Gravity.START
                 x = 0
                 y = 0
-                // API 30+ 由 fitInsetsTypes 决定是否被系统栏挤走，置 0 才铺满整屏
+                // API 30+ 由 fitInsetsTypes 决定是否被系统栏挤走，置 0 才能贴到任意位置
                 setFitInsetsTypes(0)
                 setFitInsetsSides(0)
                 setFitInsetsIgnoringVisibility(true)
-                // 打孔屏默认会把窗口裁到挖孔下方（本机正好矮 160px = 状态栏高）
+                // 打孔屏默认会把窗口裁到挖孔下方，必须允许进挖孔区
                 layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
             }
@@ -236,10 +262,7 @@ object CursorOverlay {
 
     private class CursorView(context: Context) : View(context) {
 
-        private var cursorX = 0f
-        private var cursorY = 0f
         private var visible = false
-        private var loggedSize = false
 
         private val arrow: Path = Path().apply {
             // 热点在 (0,0) 的经典左上箭头
@@ -265,37 +288,18 @@ object CursorOverlay {
             strokeJoin = Paint.Join.ROUND
         }
 
-        fun setCursor(x: Float, y: Float, show: Boolean) {
-            cursorX = x
-            cursorY = y
+        fun setCursor(show: Boolean) {
+            if (visible == show) return
             visible = show
             invalidate()
-        }
-
-        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-            super.onSizeChanged(w, h, oldw, oldh)
-            if (loggedSize) return
-            loggedSize = true
-            logGeometry()
-        }
-
-        private fun logGeometry() {
-            val loc = IntArray(2)
-            getLocationOnScreen(loc)
-            ServerCore.log("光标悬浮窗视图：${width}x${height}，位于屏幕 (${loc[0]},${loc[1]})")
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             if (!visible) return
-            // cursorX/Y 是物理屏绝对坐标，减掉窗口在屏幕上的位置才是本视图的绘制坐标
-            val loc = IntArray(2)
-            getLocationOnScreen(loc)
-            canvas.save()
-            canvas.translate(cursorX - loc[0], cursorY - loc[1])
+            // 窗口左角即光标位置（热点在 (0,0)），直接画在原点
             canvas.drawPath(arrow, fill)
             canvas.drawPath(arrow, stroke)
-            canvas.restore()
         }
     }
 }

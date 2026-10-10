@@ -552,17 +552,16 @@ class NvHttpServer(
     }
 
     /**
-     * 应用封面：**空白图**（640x360 全透明 PNG）。
+     * 应用封面：640x360 纯黑 PNG。
      *
-     * 之前这里画的是深蓝圆角块 + "Sunshine" 文字，现在按需求删掉、留空。
      * 仍然返回 200 + 合法 PNG，而不是空 body/404 —— 见 /appasset 处注释：
      * 空响应会让部分 Moonlight 客户端把整条应用记录判为异常。
      */
     private fun boxArtPng(appId: String): ByteArray = try {
         val bitmap = android.graphics.Bitmap.createBitmap(
-            640, 360, android.graphics.Bitmap.Config.ARGB_8888
+            300, 400, android.graphics.Bitmap.Config.ARGB_8888
         )
-        // 不绘制任何内容：ARGB_8888 新建即全透明
+        bitmap.eraseColor(android.graphics.Color.BLACK)
         val out = java.io.ByteArrayOutputStream()
         bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
         bitmap.recycle()
